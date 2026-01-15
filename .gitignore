@@ -1,9 +1,6 @@
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Environments
 .env
 .venv
 env/
@@ -11,8 +8,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
-# Distribution / Packaging
 build/
 develop-eggs/
 dist/
@@ -31,25 +26,14 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
-# VS Code
 .vscode/
-
-# PyCharm
-.idea/
-
-# macOS
 .DS_Store
 downloads/
-
-# Tooling caches
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .cache/
-
-# Runtime
 logs/
-
 AGENTS.md
 .cache
+backups/

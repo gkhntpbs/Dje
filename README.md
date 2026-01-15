@@ -63,27 +63,24 @@ Adding more languages is straightforward: extend `src/dje/i18n.py` and wire the 
 │       ├── settings.py      # Per-guild persisted settings
 │       ├── i18n.py          # Localization strings
 │       └── ui_shortcuts.py  # Shortcut buttons UI
-├── bin/                     # Local binaries (ffmpeg, opus)
+├── bin/                     # Local binaries (ffmpeg/opus; auto-installed by setup scripts)
 ├── .env.example             # Environment variable template
 ```
 
 ## Installation
 
-### Requirements
+### Prerequisites
 
+- Git
 - Python 3.9+ (Linux users: install `python3-venv` so `python -m venv` works)
-- FFmpeg
-  - Dje looks for `bin/ffmpeg` first (macOS binary included), then falls back to `ffmpeg` on your system `PATH`.
-  - On Linux/Windows replace `bin/ffmpeg` with a matching binary or install FFmpeg on your system.
-- Opus library (for Discord voice)
-  - Dje looks for `bin/libopus.*` first (macOS binary included), then falls back to system `libopus`/`opus`.
-  - Install via your package manager if needed (e.g., `brew install opus`, `apt install libopus0`, Windows: place a compatible `libopus.dll` in `bin/`).
 - Discord bot token (you create the bot in the Discord Developer Portal)
 - Spotify credentials (optional, required only for Spotify links):
   - `SPOTIFY_CLIENT_ID`
   - `SPOTIFY_CLIENT_SECRET`
+- Linux: `sudo` access recommended so setup can install system packages
 
-> Spotify setup guide: [SETUP_SPOTIFY.md](SETUP_SPOTIFY.md)
+> No manual binary downloads required — `setup.bat` / `setup.sh` automatically install or download FFmpeg and the Opus library.
+> If a package manager is available, the scripts use it; otherwise they download what’s needed (and keep any local binaries under `bin/`).
 
 ### Discord bot creation (high-level)
 
@@ -93,47 +90,48 @@ Adding more languages is straightforward: extend `src/dje/i18n.py` and wire the 
 
 > Discord setup guide: [SETUP_DISCORD.md](SETUP_DISCORD.md)
 
-## Setup & Run
+### Spotify client credentials
 
-1. Create a `.env` file from the example:
+> Spotify setup guide: [SETUP_SPOTIFY.md](SETUP_SPOTIFY.md)
 
-   - Copy `.env.example` to `.env`
-   - Set at least `DISCORD_TOKEN`
-   - Set `DISCORD_GUILD_ID` for fast command sync while developing (global sync can take a while)
-   - If you want Spotify links, set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` (see [SETUP_SPOTIFY.md](SETUP_SPOTIFY.md))
+## Quick Start
 
-2. Create the virtual environment and install dependencies:
-
-macOS/Linux:
-
-```bash
-chmod +x setup.sh run.sh
-./setup.sh
-```
-
-Windows:
+### Windows (PowerShell or CMD)
 
 ```bat
-setup.bat
+git clone https://github.com/gkhntpbs/Dje.git
+cd Dje
+copy .env.example .env
+notepad .env
+.\setup.bat
+.\run.bat
 ```
 
-3. Run the bot:
+Note: In `.env`, set at least `DISCORD_TOKEN` (optional: `DISCORD_GUILD_ID`, Spotify credentials).
 
-macOS/Linux:
+### macOS/Linux
 
 ```bash
+git clone https://github.com/gkhntpbs/Dje.git
+cd Dje
+cp .env.example .env
+chmod +x setup.sh run.sh
+./setup.sh
 ./run.sh
 ```
 
-Windows:
+Note: In `.env`, set at least `DISCORD_TOKEN` (optional: `DISCORD_GUILD_ID`, Spotify credentials).
 
-```bat
-run.bat
-```
+### What setup does
+
+- Creates `.venv/` and installs Python dependencies
+- Ensures FFmpeg is available (uses a package manager when possible; otherwise downloads)
+- Ensures the Opus library is available (package manager on macOS/Linux; downloads `libopus-0.dll` into `bin/` on Windows)
+- Creates required local folders (`bin/` and `downloads/`)
 
 ### Manual venv workflow (optional)
 
-If you prefer not to use the scripts:
+If you prefer not to use the scripts, make sure `ffmpeg` and the Opus library are available on your system:
 
 ```bash
 python3 -m venv .venv
@@ -146,7 +144,7 @@ python -m dje
 ## Usage
 
 1. Invite your bot to your Discord server.
-2. Start Dje locally (see Setup & Run).
+2. Start Dje locally (see Quick Start).
 3. Join a voice channel.
 4. Use `/play` with a YouTube URL, playlist URL, Spotify URL, or a search query.
 

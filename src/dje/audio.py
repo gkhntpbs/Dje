@@ -67,10 +67,17 @@ def load_opus_lib() -> None:
     if discord.opus.is_loaded():
         return
 
-    # 1. Check project/bin/libopus.dylib (or .so / .dll)
+    system = platform.system()
+
+    # 1. Check project/bin for OS-specific names
     base_path = get_base_path()
-    # Check for all common extensions in bin
-    possible_names = ["libopus.dylib", "libopus.so", "libopus.dll", "libopus.so.0"]
+    if system == "Windows":
+        possible_names = ["libopus-0.dll", "libopus.dll"]
+    elif system == "Darwin":
+        possible_names = ["libopus.dylib"]
+    else:  # Linux and others
+        possible_names = ["libopus.so.0", "libopus.so"]
+
     for name in possible_names:
         local_lib = os.path.join(base_path, "bin", name)
         if os.path.exists(local_lib):
@@ -81,11 +88,20 @@ def load_opus_lib() -> None:
                 continue
 
     # 2. Common system paths
-    opus_paths = [
-        "/opt/homebrew/lib/libopus.dylib",
-        "/usr/local/lib/libopus.dylib",
-        "libopus.so.0",
-    ]
+    if system == "Windows":
+        opus_paths = ["libopus-0.dll", "libopus.dll"]
+    elif system == "Darwin":
+        opus_paths = [
+            "/opt/homebrew/lib/libopus.dylib",
+            "/usr/local/lib/libopus.dylib",
+        ]
+    else:
+        opus_paths = [
+            "libopus.so.0",
+            "/usr/lib/libopus.so.0",
+            "/usr/lib64/libopus.so.0",
+            "/usr/local/lib/libopus.so.0",
+        ]
     
     for path in opus_paths:
         try:

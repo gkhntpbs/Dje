@@ -503,6 +503,16 @@ def main() -> None:
             value=str(len(settings_data.shortcuts)),
             inline=True,
         )
+        embed.add_field(
+            name=t("info.field_repo", locale),
+            value="https://github.com/gkhntpbs/Dje",
+            inline=False,
+        )
+        embed.add_field(
+            name=t("info.field_support", locale),
+            value="https://www.buymeacoffee.com/gkhntpbs",
+            inline=False,
+        )
         await send_message(interaction, embed=embed)
 
     async def do_skip(interaction: discord.Interaction) -> None:
