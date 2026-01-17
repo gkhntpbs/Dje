@@ -6,6 +6,7 @@ import re
 import hashlib
 import functools
 import logging
+import random
 import yt_dlp
 from discord import VoiceClient
 from typing import Optional, Dict
@@ -85,6 +86,9 @@ class GuildPlayer:
         self.idle_task: Optional[asyncio.Task] = None
         self.warn_task: Optional[asyncio.Task] = None
         self.warn_playing = False
+        self.shuffle_recent: deque[str] = deque(maxlen=10)
+        self.loop_track: Optional[Track] = None
+        self.original_queue_snapshot: list[Track] = []
 
     @property
     def voice_client(self) -> Optional[VoiceClient]:
@@ -255,21 +259,47 @@ class GuildPlayer:
         """Stop current and play previous track from history."""
         if not self.history:
             return None
-            
+
         # Get last track from history
         prev_track = self.history.pop()
-        
+
         # Override has precedence over insert-next and normal queue.
         self.override_queue.appendleft(prev_track)
         self.queue_event.set()
-        
-        # Skip current track (which will push current to history in loop, but we want to avoid duplicates if possible? 
-        # Requirement: "push the current track into history". 
+
+        # Skip current track (which will push current to history in loop, but we want to avoid duplicates if possible?
+        # Requirement: "push the current track into history".
         # So effective history: [..., Current]. Queue: [Prev, Next...].
         # Playing: Prev.
         # This is correct.
         self.skip()
         return prev_track
+
+    async def apply_shuffle(self) -> None:
+        """Shuffle the main queue based on guild settings."""
+        settings_data = await settings.get_guild_settings(self.guild_id)
+        shuffle_mode = settings_data.shuffle_mode
+
+        if shuffle_mode == "none" or not self.queue:
+            return
+
+        queue_list = list(self.queue)
+
+        if shuffle_mode == "full":
+            # Completely random
+            random.shuffle(queue_list)
+        elif shuffle_mode == "smart":
+            # Don't pick recently played tracks
+            # Prioritize non-recent tracks
+            recent_ids = set(self.shuffle_recent)
+            non_recent = [t for t in queue_list if extract_video_id(t.webpage_url) not in recent_ids]
+            recent = [t for t in queue_list if extract_video_id(t.webpage_url) in recent_ids]
+
+            random.shuffle(non_recent)
+            random.shuffle(recent)
+            queue_list = non_recent + recent  # Put recent tracks at end
+
+        self.queue = deque(queue_list)
 
     async def enqueue(self, track: Track) -> None:
         """Adds a track to the queue and ensures the loop is running."""
@@ -295,6 +325,16 @@ class GuildPlayer:
             self.insert_next_queue.extend(tracks)
         else:
             self.queue.extend(tracks)
+
+        # Apply shuffle if enabled (only to normal queue)
+        settings_data = await settings.get_guild_settings(self.guild_id)
+        if enqueue_mode == "append" and settings_data.shuffle_mode != "none":
+            await self.apply_shuffle()
+
+        # Update queue snapshot for loop
+        if settings_data.loop_mode == "queue":
+            self.original_queue_snapshot = list(self.queue)
+
         self.queue_event.set()
         await self.start()
 
@@ -320,13 +360,41 @@ class GuildPlayer:
 
         while True:
             self.next_event.clear()
-            
+
             # Helper to push finished track to history
             if self.current:
                 self.history.append(self.current)
+                # Track for smart shuffle
+                video_id = extract_video_id(self.current.webpage_url)
+                self.shuffle_recent.append(video_id)
             self.current = None
 
             try:
+                # Check for track-based loop (temporary from /play loop:single)
+                if self.loop_track and not (self.override_queue or self.insert_next_queue or self.queue):
+                    self.queue.append(self.loop_track)
+                    self.queue_event.set()
+
+                # Check for queue loop
+                settings_data = await settings.get_guild_settings(self.guild_id)
+                if settings_data.loop_mode == "queue" and not (self.override_queue or self.insert_next_queue or self.queue):
+                    if self.original_queue_snapshot:
+                        # Re-shuffle if shuffle is on
+                        if settings_data.shuffle_mode != "none":
+                            snapshot_copy = self.original_queue_snapshot.copy()
+                            random.shuffle(snapshot_copy)
+                            self.queue.extend(snapshot_copy)
+                        else:
+                            self.queue.extend(self.original_queue_snapshot)
+                        self.queue_event.set()
+
+                # Check for single track loop
+                if settings_data.loop_mode == "single" and self.current is None and self.history:
+                    # Re-add the last played track
+                    last_track = self.history[-1]
+                    self.queue.append(last_track)
+                    self.queue_event.set()
+
                 # Wait for next track
                 while not (self.override_queue or self.insert_next_queue or self.queue):
                     self.queue_event.clear()

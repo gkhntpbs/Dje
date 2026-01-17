@@ -667,6 +667,91 @@ def main() -> None:
 
         await send_message(interaction, "\n".join(lines))
 
+    async def do_shuffle(interaction: discord.Interaction) -> None:
+        locale = await get_locale(interaction)
+        if not interaction.guild:
+            await send_message(interaction, t("errors.guild_only", locale), ephemeral=True)
+            return
+        if interaction.guild.id not in players:
+            await send_message(interaction, t("errors.not_connected", locale), ephemeral=True)
+            return
+
+        player = players[interaction.guild.id]
+        settings_data = await settings.get_guild_settings(interaction.guild.id)
+
+        # Apply shuffle to current queue
+        if settings_data.shuffle_mode != "none":
+            await player.apply_shuffle()
+            count = len(player.queue)
+            key = f"shuffle.enabled_{settings_data.shuffle_mode}"
+            await send_message(
+                interaction,
+                f"{t(key, locale)}\n{t('shuffle.queue_shuffled', locale, count=count)}"
+            )
+        else:
+            await send_message(interaction, t("shuffle.disabled", locale))
+
+    async def do_loop(interaction: discord.Interaction, mode: str) -> None:
+        if not interaction.guild_id:
+            await send_message(interaction, t("errors.guild_only", "tr"), ephemeral=True)
+            return
+
+        locale = await get_locale(interaction)
+        mode_value = mode.strip().lower()
+
+        if mode_value not in ("off", "queue", "single"):
+            await send_message(interaction, t("settings.loop_invalid", locale), ephemeral=True)
+            return
+
+        # Map "off" to "none" for internal storage
+        internal_mode = "none" if mode_value == "off" else mode_value
+        await settings.set_loop_mode(interaction.guild_id, internal_mode)
+
+        # Update player state
+        if interaction.guild.id in players:
+            player = players[interaction.guild.id]
+            # Snapshot queue if switching to queue loop
+            if internal_mode == "queue" and player.queue:
+                player.original_queue_snapshot = list(player.queue)
+
+        key = f"loop.enabled_{mode_value}" if mode_value != "off" else "loop.disabled"
+        await send_message(interaction, t(key, locale))
+
+    async def do_settings_shuffle(interaction: discord.Interaction, mode: str) -> None:
+        if not interaction.guild_id:
+            await send_message(interaction, t("errors.guild_only", "tr"), ephemeral=True)
+            return
+
+        locale = await get_locale(interaction)
+
+        if mode not in ("none", "full", "smart"):
+            await send_message(interaction, t("settings.shuffle_invalid", locale), ephemeral=True)
+            return
+
+        await settings.set_shuffle_mode(interaction.guild_id, mode)
+        await send_message(interaction, t("settings.shuffle_set", locale, mode=mode))
+
+    async def do_settings_loop(interaction: discord.Interaction, mode: str) -> None:
+        if not interaction.guild_id:
+            await send_message(interaction, t("errors.guild_only", "tr"), ephemeral=True)
+            return
+
+        locale = await get_locale(interaction)
+
+        if mode not in ("none", "queue", "single"):
+            await send_message(interaction, t("settings.loop_invalid", locale), ephemeral=True)
+            return
+
+        await settings.set_loop_mode(interaction.guild_id, mode)
+
+        # Update player snapshot if switching to queue loop
+        if mode == "queue" and interaction.guild.id in players:
+            player = players[interaction.guild.id]
+            if player.queue:
+                player.original_queue_snapshot = list(player.queue)
+
+        await send_message(interaction, t("settings.loop_set", locale, mode=mode))
+
     async def do_settings_autodisconnect(interaction: discord.Interaction, state: str) -> None:
         if not interaction.guild_id:
             await send_message(interaction, t("errors.guild_only", "tr"), ephemeral=True)
@@ -725,16 +810,15 @@ def main() -> None:
             if settings_data.auto_disconnect_enabled
             else t("common.off", locale)
         )
-        await send_message(
-            interaction,
-            t(
-                "settings.autodisc.show",
-                locale,
-                enabled=enabled_text,
-                minutes=settings_data.auto_disconnect_minutes,
-                warn_minutes=settings_data.auto_disconnect_warn_minutes,
-            ),
-        )
+
+        lines = [
+            f"**Shuffle:** {settings_data.shuffle_mode}",
+            f"**Loop:** {settings_data.loop_mode}",
+            f"**Auto-disconnect:** {enabled_text}",
+            f"**Timeout:** {settings_data.auto_disconnect_minutes} min",
+            f"**Warning:** {settings_data.auto_disconnect_warn_minutes} min before disconnect",
+        ]
+        await send_message(interaction, "\n".join(lines))
 
     async def do_warn_test(interaction: discord.Interaction) -> None:
         if not interaction.guild:
@@ -841,6 +925,24 @@ def main() -> None:
     @settings_group.command(name="show", description="Show current settings")
     async def settings_show(interaction: discord.Interaction) -> None:
         await do_settings_show(interaction)
+
+    @settings_group.command(name="shuffle", description="Set shuffle mode")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Off", value="none"),
+        app_commands.Choice(name="Full Random", value="full"),
+        app_commands.Choice(name="Smart Shuffle", value="smart"),
+    ])
+    async def settings_shuffle(interaction: discord.Interaction, mode: str) -> None:
+        await do_settings_shuffle(interaction, mode)
+
+    @settings_group.command(name="loop", description="Set loop mode")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Off", value="none"),
+        app_commands.Choice(name="Queue Loop", value="queue"),
+        app_commands.Choice(name="Single Track", value="single"),
+    ])
+    async def settings_loop(interaction: discord.Interaction, mode: str) -> None:
+        await do_settings_loop(interaction, mode)
 
     @client.tree.command(name="sc", description="Alias for /shortcuts")
     async def shortcuts_alias(interaction: discord.Interaction) -> None:
@@ -1011,6 +1113,32 @@ def main() -> None:
     @client.tree.command(name="q", description="Alias for /queue")
     async def queue_alias(interaction: discord.Interaction) -> None:
         await do_queue(interaction)
+
+    @client.tree.command(name="shuffle", description="Apply shuffle to queue")
+    async def shuffle(interaction: discord.Interaction) -> None:
+        await do_shuffle(interaction)
+
+    @client.tree.command(name="sh", description="Alias for /shuffle")
+    async def shuffle_alias(interaction: discord.Interaction) -> None:
+        await do_shuffle(interaction)
+
+    @client.tree.command(name="loop", description="Set loop mode")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Off", value="off"),
+        app_commands.Choice(name="Queue", value="queue"),
+        app_commands.Choice(name="Single", value="single"),
+    ])
+    async def loop_cmd(interaction: discord.Interaction, mode: str) -> None:
+        await do_loop(interaction, mode)
+
+    @client.tree.command(name="lo", description="Alias for /loop")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Off", value="off"),
+        app_commands.Choice(name="Queue", value="queue"),
+        app_commands.Choice(name="Single", value="single"),
+    ])
+    async def loop_alias(interaction: discord.Interaction, mode: str) -> None:
+        await do_loop(interaction, mode)
 
 
     client.run(DISCORD_TOKEN)
