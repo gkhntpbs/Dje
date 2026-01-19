@@ -687,73 +687,71 @@ def schedule_deletion(filepath: str, delay_seconds: int) -> None:
     asyncio.create_task(delete_later())
 
 
-def cleanup_old_downloads() -> None:
+def _cleanup_old_downloads_sync() -> int:
+    removed_count = 0
+    if os.path.exists(DOWNLOAD_DIR):
+        for filename in os.listdir(DOWNLOAD_DIR):
+            filepath = os.path.join(DOWNLOAD_DIR, filename)
+            if os.path.isfile(filepath):
+                file_age = time.time() - os.path.getmtime(filepath)
+                if file_age > 15 * 60:
+                    os.remove(filepath)
+                    removed_count += 1
+                    logging.info("Removed stale download: %s", filename)
+    return removed_count
+
+
+async def cleanup_old_downloads() -> None:
     """Cleanup any leftover downloads on startup."""
     try:
-        removed_count = 0
-        if os.path.exists(DOWNLOAD_DIR):
-            for filename in os.listdir(DOWNLOAD_DIR):
-                filepath = os.path.join(DOWNLOAD_DIR, filename)
-                if os.path.isfile(filepath):
-                    # Delete files older than 15 minutes
-                    file_age = time.time() - os.path.getmtime(filepath)
-                    if file_age > 15 * 60:
-                        os.remove(filepath)
-                        removed_count += 1
-                        logging.info("Removed stale download: %s", filename)
+        removed_count = await asyncio.to_thread(_cleanup_old_downloads_sync)
         if removed_count:
             logging.info("Startup cleanup removed %d files", removed_count)
     except Exception as e:
         logging.error("Cleanup error: %s", e)
 
 
-def clear_all_downloads() -> int:
-    """
-    Clear ALL files in the downloads directory.
-    Returns the number of files deleted.
-    Called when /stop is used.
-    """
-    global _audio_cache, _scheduled_deletions
-    
+def _clear_all_downloads_sync() -> int:
     deleted_count = 0
-    try:
-        logging.info("Clearing all downloads")
-        if os.path.exists(DOWNLOAD_DIR):
-            for filename in os.listdir(DOWNLOAD_DIR):
-                filepath = os.path.join(DOWNLOAD_DIR, filename)
-                if os.path.isfile(filepath):
-                    try:
-                        os.remove(filepath)
-                        deleted_count += 1
-                        logging.info("Deleted file: %s", filename)
-                    except Exception as e:
-                        logging.error("Failed to delete %s: %s", filename, e)
-        
-        # Clear caches
-        _audio_cache.clear()
-        _scheduled_deletions.clear()
-        
-    except Exception as e:
-        logging.error("Cleanup error: %s", e)
-    
-    logging.info("Cleared %d files from downloads", deleted_count)
+    logging.info("Clearing all downloads")
+    if os.path.exists(DOWNLOAD_DIR):
+        for filename in os.listdir(DOWNLOAD_DIR):
+            filepath = os.path.join(DOWNLOAD_DIR, filename)
+            if os.path.isfile(filepath):
+                try:
+                    os.remove(filepath)
+                    deleted_count += 1
+                    logging.info("Deleted file: %s", filename)
+                except Exception as e:
+                    logging.error("Failed to delete %s: %s", filename, e)
     return deleted_count
 
 
+async def clear_all_downloads() -> int:
+    """Clear all files in the downloads directory. Returns the number of files deleted."""
+    global _audio_cache, _scheduled_deletions
+
+    try:
+        deleted_count = await asyncio.to_thread(_clear_all_downloads_sync)
+
+        _audio_cache.clear()
+        _scheduled_deletions.clear()
+
+        logging.info("Cleared %d files from downloads", deleted_count)
+        return deleted_count
+    except Exception as e:
+        logging.error("Cleanup error: %s", e)
+        return 0
+
+
 def get_active_filepaths(players_dict: dict) -> set:
-    """
-    Get set of filepaths that are currently playing or in queue.
-    These should NOT be deleted.
-    """
+    """Get set of filepaths that are currently playing or in queue."""
     active_paths = set()
-    
+
     for guild_id, player in players_dict.items():
-        # Current playing track
         if player.current and player.current.filepath:
             active_paths.add(player.current.filepath)
-        
-        # Tracks in queue
-        # Access internal queue list (this is safe for reading)
+
         try:
             for track in list(player.queue):
                 if track.filepath:
@@ -764,55 +762,65 @@ def get_active_filepaths(players_dict: dict) -> set:
     return active_paths
 
 
-def cleanup_inactive_downloads(players_dict: dict) -> int:
-    """
-    Delete downloads that are not currently playing or in any queue.
-    Returns number of files deleted.
-    """
-    global _audio_cache, _scheduled_deletions
-    
-    active_paths = get_active_filepaths(players_dict)
+def _cleanup_inactive_downloads_sync(active_paths: set) -> tuple[int, list[str]]:
+    """Synchronous helper for cleanup_inactive_downloads."""
     deleted_count = 0
+    deleted_files = []
+
+    if not os.path.exists(DOWNLOAD_DIR):
+        return 0, []
+
+    filenames = [
+        filename
+        for filename in os.listdir(DOWNLOAD_DIR)
+        if os.path.isfile(os.path.join(DOWNLOAD_DIR, filename))
+    ]
+    if not filenames:
+        return 0, []
+
+    logging.info("Starting inactive download cleanup")
+    for filename in filenames:
+        filepath = os.path.join(DOWNLOAD_DIR, filename)
+
+        if filepath not in active_paths:
+            try:
+                os.remove(filepath)
+                deleted_count += 1
+                deleted_files.append(filepath)
+                logging.info("Deleted inactive file: %s", filename)
+            except Exception as e:
+                logging.error("Failed to delete %s: %s", filename, e)
+
+    return deleted_count, deleted_files
+
+
+async def cleanup_inactive_downloads(players_dict: dict) -> int:
+    """Delete downloads that are not currently playing or in any queue. Returns number of files deleted."""
+    global _audio_cache, _scheduled_deletions
+
+    active_paths = get_active_filepaths(players_dict)
 
     try:
-        if not os.path.exists(DOWNLOAD_DIR):
-            return 0
+        deleted_count, deleted_files = await asyncio.to_thread(
+            _cleanup_inactive_downloads_sync,
+            active_paths
+        )
 
-        filenames = [
-            filename
-            for filename in os.listdir(DOWNLOAD_DIR)
-            if os.path.isfile(os.path.join(DOWNLOAD_DIR, filename))
-        ]
-        if not filenames:
-            return 0
+        for filepath in deleted_files:
+            for vid, (path, _) in list(_audio_cache.items()):
+                if path == filepath:
+                    del _audio_cache[vid]
+                    break
 
-        logging.info("Starting inactive download cleanup")
-        for filename in filenames:
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
+            if filepath in _scheduled_deletions:
+                del _scheduled_deletions[filepath]
 
-            if filepath not in active_paths:
-                try:
-                    os.remove(filepath)
-                    deleted_count += 1
-                    logging.info("Deleted inactive file: %s", filename)
-
-                    # Remove from cache
-                    for vid, (path, _) in list(_audio_cache.items()):
-                        if path == filepath:
-                            del _audio_cache[vid]
-                            break
-
-                    if filepath in _scheduled_deletions:
-                        del _scheduled_deletions[filepath]
-
-                except Exception as e:
-                    logging.error("Failed to delete %s: %s", filename, e)
+        if deleted_count:
+            logging.info("Inactive cleanup removed %d files", deleted_count)
+        return deleted_count
     except Exception as e:
         logging.error("Cleanup error: %s", e)
-    
-    if deleted_count:
-        logging.info("Inactive cleanup removed %d files", deleted_count)
-    return deleted_count
+        return 0
 
 
 def get_downloads_size_mb() -> float:
@@ -827,7 +835,3 @@ def get_downloads_size_mb() -> float:
     except:
         pass
     return total_size / (1024 * 1024)
-
-
-# Run cleanup on module load
-cleanup_old_downloads()

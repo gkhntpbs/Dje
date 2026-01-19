@@ -221,6 +221,110 @@ Defaults:
 Warning audio files live in `assets/warn_tr_.wav` (or `assets/warn_tr.wav`) and `assets/warn_en.mp3`.
 If they are missing, the bot will send a localized text warning instead.
 
+## Running on Unstable Networks
+
+Dje is designed to run on home networks with potentially unstable connections.
+
+### Network Resilience Features
+
+The bot includes built-in resilience mechanisms to handle network instability:
+
+1. **Circuit Breaker Pattern**: Automatically detects repeated network failures and enters a degraded state to prevent rate limiting
+2. **Exponential Backoff**: Increases retry delays after consecutive failures to avoid hammering failing services
+3. **DNS Error Detection**: Recognizes DNS resolution failures typical of VPN issues
+4. **Non-blocking I/O**: All network operations run off the event loop to prevent heartbeat delays
+5. **Network Diagnostics**: Use `/netinfo` command to check current network health status
+
+### Configuration
+
+Network resilience settings can be configured in your `.env` file:
+
+```bash
+# Exponential backoff settings (seconds)
+NETWORK_BACKOFF_BASE_SEC=2.0
+NETWORK_BACKOFF_MAX_SEC=300.0
+
+# Circuit breaker: trigger OFFLINE state after N failures in time window
+NETWORK_FAIL_WINDOW_SEC=120.0
+NETWORK_FAIL_THRESHOLD=5
+
+# Auto-restart bot when network is dead (requires supervisor)
+ENABLE_PROCESS_RESTART_ON_NETWORK_DEAD=false
+
+# HTTP timeout settings (seconds)
+AIOHTTP_TOTAL_TIMEOUT_SEC=60.0
+AIOHTTP_CONNECT_TIMEOUT_SEC=10.0
+
+# Enable improved DNS resolver (requires aiodns package)
+ENABLE_AIODNS_RESOLVER=true
+```
+
+### Troubleshooting VPN Issues
+
+If you experience frequent disconnections or DNS errors:
+
+**Check Network Status**:
+```
+/netinfo
+```
+This command shows:
+- Current network health state (OK / DEGRADED / OFFLINE)
+- Recent failure statistics
+- Time since last successful connection
+- Discord gateway status
+- Troubleshooting recommendations
+
+**Common Solutions**:
+- ✓ Ensure your VPN is connected and stable
+- ✓ Use a stable DNS resolver (1.1.1.1 or 8.8.8.8)
+- ✓ Restart VPN application if issues persist
+- ✓ Use ethernet connection if possible
+- ✓ Consider running bot on a stable VPS/server
+
+**Using a Process Supervisor**:
+
+For automatic restarts on network failures, run the bot under a supervisor:
+
+**pm2** (cross-platform):
+```bash
+npm install -g pm2
+pm2 start run.sh --name dje --interpreter bash
+pm2 logs dje
+```
+
+**systemd** (Linux):
+```bash
+sudo systemctl enable dje.service
+sudo systemctl start dje
+sudo journalctl -u dje -f
+```
+
+**launchd** (macOS):
+Create `~/Library/LaunchAgents/com.dje.bot.plist` and load with `launchctl`
+
+Set `ENABLE_PROCESS_RESTART_ON_NETWORK_DEAD=true` in your `.env` to enable automatic process exit (code 1) when the network is deemed dead, allowing the supervisor to restart the bot.
+
+### Error Messages
+
+**DNS Resolution Errors**:
+```
+DNS resolution failed - check your VPN connection.
+YouTube/Spotify may be unreachable.
+```
+This indicates VPN is not properly routing DNS queries.
+
+**Gateway Session Invalidated**:
+```
+Discord gateway: session has been invalidated
+```
+Discord.py will automatically reconnect. If this happens frequently, check your network stability.
+
+**Event Loop Lag**:
+```
+Can't keep up, websocket is behind
+```
+This means the bot's event loop is blocked. The bot now uses non-blocking I/O to prevent this, but if you see this message, check `/netinfo` for diagnostics.
+
 ## License
 
 Dje is licensed under the MIT License.

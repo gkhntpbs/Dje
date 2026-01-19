@@ -1,16 +1,22 @@
 import asyncio
 import logging
+import sys
 import discord
 from discord import app_commands
+from . import config
 from .config import DISCORD_TOKEN, DISCORD_GUILD_ID
 from . import voice, audio, youtube, player as player_module, spotify, settings, VERSION
 from . import ui, ui_shortcuts
 from .i18n import t, SUPPORTED_LOCALES
+from . import network_health
 
 # Global dictionary to hold GuildPlayer instances
 # guild_id -> GuildPlayer
 players: dict[int, player_module.GuildPlayer] = {}
 last_shortcut_order: dict[int, list[str]] = {}
+
+# Global network health monitor
+net_health: network_health.NetworkHealth = None
 
 def get_player(guild: discord.Guild) -> player_module.GuildPlayer:
     if guild.id not in players:
@@ -27,8 +33,15 @@ class AzimClient(discord.Client):
         self.cleanup_task = None
 
     async def on_ready(self) -> None:
+        global net_health
         try:
             logging.info("Logged in as %s (ID: %s)", self.user, self.user.id)
+
+            await player_module.cleanup_old_downloads()
+
+            if net_health:
+                await net_health.record_gateway_connect()
+                await net_health.record_success()
 
             if DISCORD_GUILD_ID:
                 guild = discord.Object(id=int(DISCORD_GUILD_ID))
@@ -51,6 +64,8 @@ class AzimClient(discord.Client):
 
         except Exception as e:
             logging.error("Failed to sync commands: %s", e)
+            if net_health:
+                await net_health.record_failure(e, "gateway")
     
     async def periodic_cleanup(self) -> None:
         """Background task to clean up inactive downloads every 5 minutes."""
@@ -58,10 +73,10 @@ class AzimClient(discord.Client):
         while not self.is_closed():
             await asyncio.sleep(5 * 60)  # Every 5 minutes
             try:
-                deleted = player_module.cleanup_inactive_downloads(players)
+                deleted = await player_module.cleanup_inactive_downloads(players)
                 if deleted > 0:
                     logging.info("Periodic cleanup removed %d inactive files", deleted)
-                
+
                 # Also log current size
                 size_mb = player_module.get_downloads_size_mb()
                 if size_mb > 0:
@@ -70,6 +85,21 @@ class AzimClient(discord.Client):
                 logging.error("Cleanup error: %s", e)
 
 def main() -> None:
+    global net_health
+
+    # Initialize network health monitor
+    net_health = network_health.NetworkHealth(
+        backoff_base_sec=config.NETWORK_BACKOFF_BASE_SEC,
+        backoff_max_sec=config.NETWORK_BACKOFF_MAX_SEC,
+        fail_window_sec=config.NETWORK_FAIL_WINDOW_SEC,
+        fail_threshold=config.NETWORK_FAIL_THRESHOLD,
+    )
+    logging.info(
+        "Network health monitor initialized (threshold: %d failures in %ds window)",
+        config.NETWORK_FAIL_THRESHOLD,
+        int(config.NETWORK_FAIL_WINDOW_SEC)
+    )
+
     # Ensure opus is loaded before doing anything voice-related
     audio.load_opus_lib()
     logging.info("Launching Discord client")
@@ -230,6 +260,8 @@ def main() -> None:
                 await send_error(interaction, t("errors.spotify_not_configured", locale))
                 return
             except spotify.SpotifyError as e:
+                if network_health.is_dns_error(e) or "network error" in str(e).lower():
+                    await net_health.record_failure(e, "spotify_api")
                 await send_error(interaction, t("errors.spotify_error", locale, error=e))
                 return
             except Exception as e:
@@ -263,13 +295,16 @@ def main() -> None:
                 return
 
             except youtube.YouTubeError as e:
+                if network_health.is_dns_error(e) or "dns resolution failed" in str(e).lower():
+                    await net_health.record_failure(e, "youtube_api")
                 await send_error(interaction, t("errors.playlist_load_failed", locale, error=e))
                 return
 
-        # 6. Single Track Logic (Existing optimized flow)
         try:
             track = await youtube.resolve(query, interaction.user.display_name)
         except youtube.YouTubeError as e:
+            if network_health.is_dns_error(e) or "dns resolution failed" in str(e).lower():
+                await net_health.record_failure(e, "youtube_api")
             await send_error(interaction, t("errors.track_not_found", locale, error=e))
             return
 
@@ -599,10 +634,14 @@ def main() -> None:
         if interaction.guild.id in players:
             player = players[interaction.guild.id]
             await player.stop()
-            await player.schedule_idle_disconnect()
-            deleted_count = player_module.clear_all_downloads()
+            deleted_count = await player_module.clear_all_downloads()
             if deleted_count > 0:
-                    logging.info("/stop removed %d files", deleted_count)
+                logging.info("/stop removed %d files", deleted_count)
+
+            voice_client = interaction.guild.voice_client
+            if voice_client:
+                await voice_client.disconnect()
+
             await send_message(interaction, t("playback.stopped", locale))
         else:
             await send_message(interaction, t("errors.nothing_playing", locale), ephemeral=True)
@@ -1140,6 +1179,93 @@ def main() -> None:
     async def loop_alias(interaction: discord.Interaction, mode: str) -> None:
         await do_loop(interaction, mode)
 
+    @client.tree.command(name="netinfo", description="Show network health diagnostics")
+    async def netinfo(interaction: discord.Interaction) -> None:
+        """Display network health status and troubleshooting info."""
+        locale = await get_locale(interaction)
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            stats = await net_health.get_stats()
+            diagnostics = net_health.get_diagnostics()
+
+            # Build status message
+            lines = []
+
+            # State indicator
+            state_emoji = {
+                network_health.NetworkState.OK: "✅",
+                network_health.NetworkState.DEGRADED: "⚠️",
+                network_health.NetworkState.OFFLINE: "🔴"
+            }
+            emoji = state_emoji.get(stats.state, "❓")
+            lines.append(f"{emoji} **Network Status:** {stats.state.value.upper()}")
+            lines.append("")
+
+            # Statistics
+            lines.append("**Statistics:**")
+            lines.append(f"• Consecutive failures: {stats.consecutive_failures}")
+            lines.append(f"• Total failures: {stats.total_failures}")
+
+            if stats.last_success_time:
+                seconds_ago = diagnostics.get("seconds_since_success", 0)
+                if seconds_ago < 60:
+                    time_str = f"{seconds_ago}s ago"
+                elif seconds_ago < 3600:
+                    time_str = f"{seconds_ago // 60}m ago"
+                else:
+                    time_str = f"{seconds_ago // 3600}h ago"
+                lines.append(f"• Last success: {time_str}")
+
+            if stats.gateway_connect_time:
+                seconds_ago = diagnostics.get("seconds_since_gateway_connect", 0)
+                if seconds_ago < 60:
+                    time_str = f"{seconds_ago}s ago"
+                elif seconds_ago < 3600:
+                    time_str = f"{seconds_ago // 60}m ago"
+                else:
+                    time_str = f"{seconds_ago // 3600}h ago"
+                lines.append(f"• Discord gateway: Connected {time_str}")
+
+            if stats.event_loop_lag_detected:
+                lines.append("⚠️ Event loop lag detected")
+
+            # Recent failures by type
+            if "recent_failure_types" in diagnostics and diagnostics["recent_failure_types"]:
+                lines.append("")
+                lines.append("**Recent Failures (last 2 minutes):**")
+                for error_type, count in diagnostics["recent_failure_types"].items():
+                    lines.append(f"• {error_type}: {count}")
+
+            # Last failure message
+            if stats.last_failure_message:
+                lines.append("")
+                lines.append("**Last Error:**")
+                # Truncate long error messages
+                error_msg = stats.last_failure_message
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                lines.append(f"```{error_msg}```")
+
+            # WARP troubleshooting tips if network is not OK
+            if stats.state != network_health.NetworkState.OK:
+                lines.append("")
+                lines.append("**Troubleshooting Tips for WARP/VPN:**")
+                tips = network_health.get_warp_troubleshooting_tips()
+                for tip in tips[:5]:  # Show first 5 tips
+                    lines.append(tip)
+
+            message = "\n".join(lines)
+
+            # Send as ephemeral message
+            await interaction.followup.send(message, ephemeral=True)
+
+        except Exception as e:
+            logging.error("Error in netinfo command: %s", e)
+            await interaction.followup.send(
+                f"❌ Failed to retrieve network info: {e}",
+                ephemeral=True
+            )
 
     client.run(DISCORD_TOKEN)
 

@@ -3,6 +3,7 @@ Spotify metadata resolver module.
 Fetches track/album/playlist metadata from Spotify and converts to YouTube search queries.
 """
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
@@ -10,6 +11,8 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
 from .config import SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
+
+logger = logging.getLogger(__name__)
 
 # Default limit for tracks per request
 SPOTIFY_MAX_TRACKS = 50
@@ -134,16 +137,23 @@ async def resolve_track(track_id: str) -> Tuple[List[SearchItem], int, Optional[
     try:
         track_data = await loop.run_in_executor(None, _fetch)
         item = _extract_track_info(track_data)
-        
+
         if item:
             name = f"{item.artist_names} - {item.title}"
             return [item], 0, name
         else:
             return [], 1, None
-            
+
     except SpotifyNotConfiguredError:
         raise
     except Exception as e:
+        error_msg = str(e).lower()
+        # Check for DNS/connection errors
+        if any(keyword in error_msg for keyword in ['dns', 'connection', 'timeout', 'getaddrinfo', 'nodename']):
+            logger.error("Network error connecting to Spotify API. Likely VPN/WARP issue: %s", e)
+            raise SpotifyError(
+                "Network error connecting to Spotify - check your WARP/VPN connection."
+            )
         raise SpotifyError(f"Failed to fetch track: {e}")
 
 
@@ -202,6 +212,13 @@ async def resolve_playlist(playlist_id: str, limit: int = SPOTIFY_MAX_TRACKS) ->
     except SpotifyNotConfiguredError:
         raise
     except Exception as e:
+        error_msg = str(e).lower()
+        # Check for DNS/connection errors
+        if any(keyword in error_msg for keyword in ['dns', 'connection', 'timeout', 'getaddrinfo', 'nodename']):
+            logger.error("Network error connecting to Spotify API. Likely VPN/WARP issue: %s", e)
+            raise SpotifyError(
+                "Network error connecting to Spotify - check your WARP/VPN connection."
+            )
         raise SpotifyError(f"Failed to fetch playlist: {e}")
 
 
@@ -262,4 +279,11 @@ async def resolve_album(album_id: str, limit: int = SPOTIFY_MAX_TRACKS) -> Tuple
     except SpotifyNotConfiguredError:
         raise
     except Exception as e:
+        error_msg = str(e).lower()
+        # Check for DNS/connection errors
+        if any(keyword in error_msg for keyword in ['dns', 'connection', 'timeout', 'getaddrinfo', 'nodename']):
+            logger.error("Network error connecting to Spotify API. Likely VPN/WARP issue: %s", e)
+            raise SpotifyError(
+                "Network error connecting to Spotify - check your WARP/VPN connection."
+            )
         raise SpotifyError(f"Failed to fetch album: {e}")

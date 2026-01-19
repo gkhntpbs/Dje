@@ -20,6 +20,12 @@ dependencies = [
     "spotipy",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

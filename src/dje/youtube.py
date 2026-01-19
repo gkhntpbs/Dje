@@ -1,11 +1,14 @@
 import asyncio
 import functools
+import logging
 import yt_dlp
 from typing import List, Tuple
 from .tracks import Track
 
 # Suppress noise
 yt_dlp.utils.bug_reports_message = lambda *args, **kwargs: ''
+
+logger = logging.getLogger(__name__)
 
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
@@ -26,7 +29,7 @@ async def resolve(query: str, requested_by: str) -> Track:
     Runs blocking yt-dlp code in a separate thread.
     """
     loop = asyncio.get_running_loop()
-    
+
     try:
         with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
             partial = functools.partial(ydl.extract_info, query, download=False)
@@ -40,6 +43,16 @@ async def resolve(query: str, requested_by: str) -> Track:
             data = data['entries'][0]
 
         return _create_track(data, requested_by)
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e).lower()
+        # Check for DNS-related errors
+        if any(keyword in error_msg for keyword in ['dns', 'nodename', 'name resolution', 'getaddrinfo']):
+            logger.error("DNS resolution failed for YouTube query. Likely VPN/WARP issue: %s", e)
+            raise YouTubeError(
+                "DNS resolution failed - check your WARP/VPN connection. "
+                "YouTube may be unreachable."
+            )
+        raise YouTubeError(f"Failed to resolve track: {str(e)}")
     except Exception as e:
         raise YouTubeError(f"Failed to resolve track: {str(e)}")
 
@@ -49,42 +62,42 @@ async def resolve_playlist(playlist_url: str, requested_by: str, limit: int = 50
     Returns (tracks, skipped_count).
     """
     loop = asyncio.get_running_loop()
-    
+
     opts = YTDL_OPTIONS.copy()
     opts.update({
         'noplaylist': False,
         'extract_flat': 'in_playlist',  # Extract video info quickly, don't download
     })
-    
+
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             partial = functools.partial(ydl.extract_info, playlist_url, download=False)
             data = await loop.run_in_executor(None, partial)
-            
+
         if not data or 'entries' not in data:
             raise YouTubeError("Could not find playlist entries.")
-            
+
         tracks = []
         skipped = 0
         entries = data['entries']
-        
+
         # Handle generator if entries is a generator
         if not isinstance(entries, list):
             try:
                 entries = list(entries)
             except:
                 raise YouTubeError("Failed to list entries.")
-            
+
         for entry in entries:
             if len(tracks) >= limit:
                 break
-                
+
             # Skip private/unavailable videos
             if not entry:
                 skipped += 1
                 continue
-                
-            # extract_flat='in_playlist' usually returns reduced info. 
+
+            # extract_flat='in_playlist' usually returns reduced info.
             # We ensure we have at least a url and title.
             if not entry.get('url') and not entry.get('id'):
                 skipped += 1
@@ -96,9 +109,19 @@ async def resolve_playlist(playlist_url: str, requested_by: str, limit: int = 50
             except:
                 skipped += 1
                 continue
-                
+
         return tracks, skipped
 
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e).lower()
+        # Check for DNS-related errors
+        if any(keyword in error_msg for keyword in ['dns', 'nodename', 'name resolution', 'getaddrinfo']):
+            logger.error("DNS resolution failed for YouTube playlist. Likely VPN/WARP issue: %s", e)
+            raise YouTubeError(
+                "DNS resolution failed - check your WARP/VPN connection. "
+                "YouTube may be unreachable."
+            )
+        raise YouTubeError(f"Failed to resolve playlist: {str(e)}")
     except Exception as e:
         raise YouTubeError(f"Failed to resolve playlist: {str(e)}")
 
