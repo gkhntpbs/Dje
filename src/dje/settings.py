@@ -20,13 +20,17 @@ class GuildSettings:
     auto_disconnect_enabled: bool = True
     auto_disconnect_minutes: int = 60
     auto_disconnect_warn_minutes: int = 15
+    auto_disconnect_warning_enabled: bool = True
     shuffle_mode: str = "none"
     loop_mode: str = "none"
+    autoplay_enabled: bool = False
 
 
 AUTO_DISCONNECT_DEFAULT_ENABLED = True
+AUTOPLAY_DEFAULT_ENABLED = False
 AUTO_DISCONNECT_DEFAULT_MINUTES = 60
 AUTO_DISCONNECT_DEFAULT_WARN_MINUTES = 15
+AUTO_DISCONNECT_WARNING_DEFAULT_ENABLED = True
 SHUFFLE_MODE_DEFAULT = "none"
 LOOP_MODE_DEFAULT = "none"
 
@@ -138,14 +142,22 @@ async def get_guild_settings(guild_id: int) -> GuildSettings:
         loop_mode = str(entry.get("loop_mode", LOOP_MODE_DEFAULT))
         if loop_mode not in ("none", "queue", "single"):
             loop_mode = LOOP_MODE_DEFAULT
+        autoplay_enabled = _extract_bool(
+            entry, "autoplay_enabled", AUTOPLAY_DEFAULT_ENABLED
+        )
+        auto_disconnect_warning_enabled = _extract_bool(
+            entry, "auto_disconnect_warning_enabled", AUTO_DISCONNECT_WARNING_DEFAULT_ENABLED
+        )
         return GuildSettings(
             locale=locale,
             shortcuts=shortcuts,
             auto_disconnect_enabled=auto_disconnect_enabled,
             auto_disconnect_minutes=auto_disconnect_minutes,
             auto_disconnect_warn_minutes=auto_disconnect_warn_minutes,
+            auto_disconnect_warning_enabled=auto_disconnect_warning_enabled,
             shuffle_mode=shuffle_mode,
             loop_mode=loop_mode,
+            autoplay_enabled=autoplay_enabled,
         )
 
 
@@ -213,6 +225,17 @@ async def set_auto_disconnect_minutes(guild_id: int, minutes: int) -> None:
         await asyncio.to_thread(_atomic_write, data)
 
 
+async def set_auto_disconnect_warning_enabled(guild_id: int, enabled: bool) -> None:
+    async with _lock:
+        data = await asyncio.to_thread(_read_all)
+        entry = _get_entry(data, guild_id)
+        entry["auto_disconnect_warning_enabled"] = bool(enabled)
+        entry["locale"] = _normalize_locale(str(entry.get("locale", "tr")))
+        entry["shortcuts"] = _extract_shortcuts(entry)
+        data[str(guild_id)] = entry
+        await asyncio.to_thread(_atomic_write, data)
+
+
 async def list_shortcuts(guild_id: int) -> list[tuple[str, str]]:
     settings = await get_guild_settings(guild_id)
     items = list(settings.shortcuts.items())
@@ -252,7 +275,13 @@ async def set_shuffle_mode(guild_id: int, mode: str) -> None:
         entry["auto_disconnect_warn_minutes"] = _extract_int(
             entry, "auto_disconnect_warn_minutes", AUTO_DISCONNECT_DEFAULT_WARN_MINUTES
         )
+        entry["auto_disconnect_warning_enabled"] = _extract_bool(
+            entry, "auto_disconnect_warning_enabled", AUTO_DISCONNECT_WARNING_DEFAULT_ENABLED
+        )
         entry["loop_mode"] = str(entry.get("loop_mode", LOOP_MODE_DEFAULT))
+        entry["autoplay_enabled"] = _extract_bool(
+            entry, "autoplay_enabled", AUTOPLAY_DEFAULT_ENABLED
+        )
 
         data[str(guild_id)] = entry
         await asyncio.to_thread(_atomic_write, data)
@@ -282,7 +311,43 @@ async def set_loop_mode(guild_id: int, mode: str) -> None:
         entry["auto_disconnect_warn_minutes"] = _extract_int(
             entry, "auto_disconnect_warn_minutes", AUTO_DISCONNECT_DEFAULT_WARN_MINUTES
         )
+        entry["auto_disconnect_warning_enabled"] = _extract_bool(
+            entry, "auto_disconnect_warning_enabled", AUTO_DISCONNECT_WARNING_DEFAULT_ENABLED
+        )
         entry["shuffle_mode"] = str(entry.get("shuffle_mode", SHUFFLE_MODE_DEFAULT))
+        entry["autoplay_enabled"] = _extract_bool(
+            entry, "autoplay_enabled", AUTOPLAY_DEFAULT_ENABLED
+        )
+
+        data[str(guild_id)] = entry
+        await asyncio.to_thread(_atomic_write, data)
+
+
+async def set_autoplay_enabled(guild_id: int, enabled: bool) -> None:
+    async with _lock:
+        data = await asyncio.to_thread(_read_all)
+        entry = _get_entry(data, guild_id)
+
+        # Set new field
+        entry["autoplay_enabled"] = bool(enabled)
+
+        # CRITICAL: Preserve ALL existing fields
+        entry["locale"] = _normalize_locale(str(entry.get("locale", "tr")))
+        entry["shortcuts"] = _extract_shortcuts(entry)
+        entry["auto_disconnect_enabled"] = _extract_bool(
+            entry, "auto_disconnect_enabled", AUTO_DISCONNECT_DEFAULT_ENABLED
+        )
+        entry["auto_disconnect_minutes"] = _extract_int(
+            entry, "auto_disconnect_minutes", AUTO_DISCONNECT_DEFAULT_MINUTES
+        )
+        entry["auto_disconnect_warn_minutes"] = _extract_int(
+            entry, "auto_disconnect_warn_minutes", AUTO_DISCONNECT_DEFAULT_WARN_MINUTES
+        )
+        entry["auto_disconnect_warning_enabled"] = _extract_bool(
+            entry, "auto_disconnect_warning_enabled", AUTO_DISCONNECT_WARNING_DEFAULT_ENABLED
+        )
+        entry["shuffle_mode"] = str(entry.get("shuffle_mode", SHUFFLE_MODE_DEFAULT))
+        entry["loop_mode"] = str(entry.get("loop_mode", LOOP_MODE_DEFAULT))
 
         data[str(guild_id)] = entry
         await asyncio.to_thread(_atomic_write, data)

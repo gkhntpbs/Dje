@@ -36,7 +36,7 @@ Dje currently supports:
 - English (`en`)
 - Turkish (`tr`)
 
-Locale is selected per guild via `/language` (alias: `/lang`) and persisted in `data/guild_settings.json`.
+Locale is selected per guild via `/settings language` and persisted in `data/guild_settings.json`.
 
 Adding more languages is straightforward: extend `src/dje/i18n.py` and wire the new locale into the command choices.
 
@@ -62,6 +62,7 @@ Adding more languages is straightforward: extend `src/dje/i18n.py` and wire the 
 │       ├── voice.py         # Voice channel connect/disconnect helpers
 │       ├── settings.py      # Per-guild persisted settings
 │       ├── i18n.py          # Localization strings
+│       ├── ui.py            # UI components (Now Playing view with buttons)
 │       └── ui_shortcuts.py  # Shortcut buttons UI
 ├── bin/                     # Local binaries (ffmpeg/opus; auto-installed by setup scripts)
 ├── .env.example             # Environment variable template
@@ -159,49 +160,62 @@ Notes:
 
 ### Playback
 
-- `/play <query-or-url>` (alias: `/p`): Play a track by search/URL; supports Spotify links.
+- `/play <query-or-url>`: Play a track by search/URL; supports Spotify links.
 - `/playnext <query-or-url>`: Insert right after the current track.
-- `/pause` (alias: `/pa`): Pause playback.
-- `/resume` (alias: `/r`): Resume playback.
-- `/skip` (alias: `/sk`): Skip the current track.
-- `/next` (alias: `/n`): Alias for skip.
-- `/prev` (alias: `/pr`): Play the previous track from history.
-- `/stop` (alias: `/st`): Stop playback and clear the queue.
+- `/pause`: Pause playback.
+- `/resume`: Resume playback.
+- `/skip`: Skip the current track.
+- `/next`: Skip to next track (same as skip).
+- `/prev`: Play the previous track from history.
+- `/stop`: Stop playback and clear the queue.
 
-### Queue
+### Queue Management
 
-- `/queue` (alias: `/q`): Show previous/now playing/up next.
+- `/queue`: Show previous/now playing/up next.
+- `/clear`: Clear all upcoming tracks from queue.
+- `/remove <position>`: Remove a specific track from queue by position.
+- `/shuffle`: Apply shuffle to queue (smart/full shuffle modes available in settings).
+- `/loop`: Set loop mode (off/queue/single).
 
 ### Voice
 
-- `/join` (alias: `/j`): Join your voice channel.
-- `/leave` (alias: `/l`): Leave the voice channel.
+- `/join`: Join your voice channel.
+- `/leave`: Leave the voice channel.
 
 ### Shortcuts
 
-- `/shortcuts`: List shortcuts with interactive buttons.
-- `/sc`: Alias for `/shortcuts`.
-- `/shortcuts add <name> <url>` (alias: `/shortcuts a`): Save a shortcut (YouTube/Spotify URL).
-- `/shortcuts remove <name>` (alias: `/shortcuts rm`): Remove a shortcut.
-- `/shortcuts play <name-or-number>` (alias: `/shortcuts p`): Play a shortcut by name, or by number from the last `/shortcuts` list.
+- `/shortcuts list`: List shortcuts with interactive buttons.
+- `/shortcuts add <name> <url>`: Save a shortcut (YouTube/Spotify URL).
+- `/shortcuts remove <name>`: Remove a shortcut.
+- `/shortcuts play <name-or-number>`: Play a shortcut by name, or by number from the last list.
 
 ### Settings
 
-- `/language <tr|en>` (alias: `/lang`): Set the guild locale.
+- `/settings show`: Show all current guild settings.
+- `/settings language <tr|en>`: Set the guild locale.
+- `/settings shuffle <none|full|smart>`: Set shuffle mode.
+- `/settings loop <none|queue|single>`: Set loop mode.
+- `/settings autoplay <on|off>`: Enable/disable autoplay (adds similar tracks when queue is empty).
 - `/settings autodisconnect <on|off>`: Enable or disable idle auto-disconnect.
 - `/settings autodisconnect_minutes <minutes>`: Set idle timeout (20-360).
-- `/settings show`: Show current guild settings.
+- `/settings autodisconnect_warning <on|off>`: Toggle warning audio before auto-disconnect.
 
-### Info
+### Info & Utilities
 
-- `/info` (alias: `/i`): Show bot info.
+- `/help`: Show all available commands organized by category.
+- `/info`: Show bot information, statistics, and links.
+- `/timestamp`: Show current track timeline with progress bar.
+- `/lyrics`: Fetch and display lyrics for the current track.
+- `/invite`: Get bot invite link with proper permissions.
+- `/support`: Support the developer.
+- `/netinfo`: Show network health diagnostics (useful for troubleshooting VPN issues).
 
 ## Shortcuts System
 
 Shortcuts are per-guild, named links that you can save and replay quickly.
 
 - Add a shortcut: `/shortcuts add <name> <url>`
-- List shortcuts (with buttons): `/shortcuts` (or `/sc`)
+- List shortcuts (with buttons): `/shortcuts list`
 - Play a shortcut by name: `/shortcuts play <name>`
 - Play by number (after listing): `/shortcuts play 1`
 
@@ -212,11 +226,14 @@ Shortcuts are persisted in `data/guild_settings.json` (the `data/` directory is 
 When the bot is idle (not playing and queue empty), it starts a timer. Fifteen minutes
 before disconnect it plays a localized warning clip in the voice channel.
 
+The warning audio can be toggled with `/settings autodisconnect_warning on|off`.
+
 Defaults:
 
 - Enabled
 - Timeout: 60 minutes
-- Warning: 15 minutes before disconnect
+- Warning audio: Enabled
+- Warning time: 15 minutes before disconnect
 
 Warning audio files live in `assets/warn_tr_.wav` (or `assets/warn_tr.wav`) and `assets/warn_en.mp3`.
 If they are missing, the bot will send a localized text warning instead.

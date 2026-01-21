@@ -27,3 +27,21 @@ AIOHTTP_CONNECT_TIMEOUT_SEC = float(os.getenv("AIOHTTP_CONNECT_TIMEOUT_SEC", "10
 
 # DNS resolver configuration
 ENABLE_AIODNS_RESOLVER = os.getenv("ENABLE_AIODNS_RESOLVER", "true").lower() == "true"
+
+# WARP/VPN workaround configuration
+# Set to true to disable SSL verification for Discord connections (use when WARP causes SSL errors)
+DISABLE_DISCORD_SSL_VERIFY = os.getenv("DISABLE_DISCORD_SSL_VERIFY", "false").lower() == "true"
+
+# Custom DNS servers to use (comma-separated, e.g., "8.8.8.8,1.1.1.1")
+# Helps bypass WARP DNS issues
+CUSTOM_DNS_SERVERS = os.getenv("CUSTOM_DNS_SERVERS", "8.8.8.8,8.8.4.4,1.1.1.1,1.0.0.1")
+
+# Audio quality configuration
+# Format: "opus" (recommended, smaller files, no re-encoding) or "mp3" (legacy)
+DJE_AUDIO_FORMAT = os.getenv("DJE_AUDIO_FORMAT", "opus").lower()
+# Bitrate in kbps (64-320)
+DJE_AUDIO_BITRATE = os.getenv("DJE_AUDIO_BITRATE", "128")
+# Enable audio normalization (loudnorm filter) for consistent volume
+DJE_AUDIO_NORMALIZE = os.getenv("DJE_AUDIO_NORMALIZE", "false").lower() == "true"
+# Enable verbose audio debugging logs
+DJE_AUDIO_DEBUG = os.getenv("DJE_AUDIO_DEBUG", "false").lower() == "true"

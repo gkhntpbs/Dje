@@ -13,6 +13,7 @@ from typing import Optional, Dict
 from .tracks import Track
 from . import audio
 from . import settings
+from . import autoplay
 from .i18n import t
 
 # Directory for downloaded audio files
@@ -29,6 +30,49 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Maximum duration in seconds (20 minutes)
 MAX_DURATION_SECONDS = 20 * 60
+
+# FFmpeg options for improved audio quality and stability
+# -thread_queue_size 4096: Prevents buffer underruns during I/O spikes
+# -analyzeduration 0: Faster startup (we know it's audio)
+# -probesize 32768: Small probe for local files (32KB)
+FFMPEG_BEFORE_OPTIONS = '-nostdin -thread_queue_size 4096 -analyzeduration 0 -probesize 32768'
+# -vn: No video, -bufsize 1M: Larger output buffer
+FFMPEG_OPTIONS = '-vn -bufsize 1M'
+
+# Retry settings for playback
+PLAYBACK_MAX_RETRIES = 2
+PLAYBACK_RETRY_DELAY = 0.5
+
+
+def create_audio_source(filepath: str, ffmpeg_path: str) -> discord.AudioSource:
+    """
+    Create the appropriate audio source based on file format.
+    Uses FFmpegOpusAudio with passthrough for .opus files (no re-encoding).
+    Falls back to FFmpegPCMAudio for other formats.
+    """
+    from . import audio_debug
+
+    if filepath.endswith('.opus'):
+        # Use Opus passthrough - no re-encoding needed
+        if audio_debug.is_debug_enabled():
+            logging.debug("Using FFmpegOpusAudio passthrough for: %s", filepath)
+        return discord.FFmpegOpusAudio(
+            filepath,
+            executable=ffmpeg_path,
+            before_options=FFMPEG_BEFORE_OPTIONS,
+            codec='copy'  # Passthrough - no re-encoding
+        )
+    else:
+        # Use PCM audio for other formats (mp3, etc.)
+        if audio_debug.is_debug_enabled():
+            logging.debug("Using FFmpegPCMAudio for: %s", filepath)
+        return discord.FFmpegPCMAudio(
+            filepath,
+            executable=ffmpeg_path,
+            before_options=FFMPEG_BEFORE_OPTIONS,
+            options=FFMPEG_OPTIONS
+        )
+
 
 # Cache: video_id -> (filepath, last_access_time)
 _audio_cache: Dict[str, tuple[str, float]] = {}
@@ -89,6 +133,11 @@ class GuildPlayer:
         self.shuffle_recent: deque[str] = deque(maxlen=10)
         self.loop_track: Optional[Track] = None
         self.original_queue_snapshot: list[Track] = []
+        self.autoplay_manager = autoplay.get_autoplay_manager(guild_id)
+        self.autoplay_fetching = False
+        self.playback_start_time: Optional[float] = None
+        self.playback_paused_at: Optional[float] = None
+        self.total_paused_duration: float = 0.0
 
     @property
     def voice_client(self) -> Optional[VoiceClient]:
@@ -112,6 +161,18 @@ class GuildPlayer:
         if self.current is not None:
             return False
         return True
+
+    def get_current_position(self) -> Optional[float]:
+        """Get current playback position in seconds"""
+        if not self.playback_start_time:
+            return None
+
+        if self.playback_paused_at:
+            # Paused - return position at pause time
+            return self.playback_paused_at - self.playback_start_time - self.total_paused_duration
+        else:
+            # Playing - return current position
+            return time.time() - self.playback_start_time - self.total_paused_duration
 
     def _stop_warning_playback(self) -> None:
         vc = self.voice_client
@@ -153,6 +214,8 @@ class GuildPlayer:
             await asyncio.sleep(delay_seconds)
             settings_data = await settings.get_guild_settings(self.guild_id)
             if not settings_data.auto_disconnect_enabled:
+                return
+            if not settings_data.auto_disconnect_warning_enabled:
                 return
             if not self.is_idle():
                 return
@@ -202,7 +265,12 @@ class GuildPlayer:
             return
         ffmpeg_path = audio.get_ffmpeg_executable()
         try:
-            source = discord.FFmpegPCMAudio(clip_path, executable=ffmpeg_path)
+            source = discord.FFmpegPCMAudio(
+                clip_path,
+                executable=ffmpeg_path,
+                before_options=FFMPEG_BEFORE_OPTIONS,
+                options=FFMPEG_OPTIONS
+            )
             self.warn_playing = True
 
             def _after(_: Optional[Exception]) -> None:
@@ -229,6 +297,7 @@ class GuildPlayer:
         self.history.clear()
         self.current = None
         self._stop_warning_playback()
+        self.autoplay_manager.clear_history()
         if self.voice_client:
             if self.voice_client.is_playing() or self.voice_client.is_paused():
                 self.voice_client.stop()
@@ -245,6 +314,7 @@ class GuildPlayer:
         """Pauses playback. Returns True if successful."""
         if self.voice_client and self.voice_client.is_playing():
             self.voice_client.pause()
+            self.playback_paused_at = time.time()
             return True
         return False
 
@@ -252,6 +322,11 @@ class GuildPlayer:
         """Resumes playback. Returns True if successful."""
         if self.voice_client and self.voice_client.is_paused():
             self.voice_client.resume()
+            if self.playback_paused_at:
+                # Add the pause duration to total
+                pause_duration = time.time() - self.playback_paused_at
+                self.total_paused_duration += pause_duration
+                self.playback_paused_at = None
             return True
         return False
         
@@ -350,9 +425,93 @@ class GuildPlayer:
 
     def _after_playback(self, error: Optional[Exception]) -> None:
         """Callback called by discord.py when audio finishes."""
+        from . import audio_debug
+
         if error:
-            logging.error("Playback error: %s", error)
+            track_title = self.current.title if self.current else "unknown"
+            error_str = str(error)
+
+            # Categorize error type for better logging
+            if "ffmpeg" in error_str.lower() or "Errno" in error_str:
+                error_type = "FFmpeg"
+            elif "connection" in error_str.lower():
+                error_type = "Connection"
+            else:
+                error_type = "Playback"
+
+            logging.error("[%s] Error for %s: %s", error_type, track_title, error)
+            audio_debug.log_playback_error(error_type, error_str)
+
+            if audio_debug.is_debug_enabled():
+                logging.debug("Full error details: %r", error)
+        else:
+            if self.current:
+                logging.info("Playback finished normally: %s", self.current.title)
         self.next_event.set()
+
+    async def _play_with_retry(
+        self, vc: VoiceClient, source_factory, track_title: str
+    ) -> bool:
+        """
+        Attempt to play audio with retry logic.
+        Returns True if playback started successfully, False otherwise.
+        """
+        from . import audio_debug
+
+        for attempt in range(PLAYBACK_MAX_RETRIES + 1):
+            try:
+                if attempt > 0:
+                    if audio_debug.is_debug_enabled():
+                        logging.debug(
+                            "Retry attempt %d/%d for: %s",
+                            attempt, PLAYBACK_MAX_RETRIES, track_title
+                        )
+                    audio_debug.log_ffmpeg_retry()
+                    await asyncio.sleep(PLAYBACK_RETRY_DELAY)
+                    # Recreate source for retry
+                    source = source_factory()
+                else:
+                    source = source_factory()
+
+                vc.play(source, after=self._after_playback)
+                audio_debug.log_playback_start()
+                return True
+
+            except Exception as e:
+                logging.warning(
+                    "Playback attempt %d failed for %s: %s",
+                    attempt + 1, track_title, e
+                )
+                if attempt >= PLAYBACK_MAX_RETRIES:
+                    logging.error(
+                        "All %d playback attempts failed for: %s",
+                        PLAYBACK_MAX_RETRIES + 1, track_title
+                    )
+                    audio_debug.log_playback_error("FFmpeg", str(e))
+                    return False
+
+        return False
+
+    async def _ensure_voice_connection(self) -> bool:
+        """
+        Ensure voice connection is active.
+        Waits up to 3 seconds for discord.py auto-reconnect.
+        Returns True if connected, False if unrecoverable.
+        """
+        vc = self.voice_client
+        if vc and vc.is_connected():
+            return True
+
+        # Wait for potential auto-reconnect
+        for _ in range(6):  # 6 x 0.5s = 3 seconds
+            await asyncio.sleep(0.5)
+            vc = self.voice_client
+            if vc and vc.is_connected():
+                logging.info("Voice connection recovered")
+                return True
+
+        logging.warning("Voice connection could not be recovered")
+        return False
 
     async def player_loop(self) -> None:
         """Main background loop."""
@@ -367,6 +526,8 @@ class GuildPlayer:
                 # Track for smart shuffle
                 video_id = extract_video_id(self.current.webpage_url)
                 self.shuffle_recent.append(video_id)
+                # Record for autoplay recommendations
+                asyncio.create_task(self.autoplay_manager.record_played_track(self.current))
             self.current = None
 
             try:
@@ -395,6 +556,19 @@ class GuildPlayer:
                     self.queue.append(last_track)
                     self.queue_event.set()
 
+                # Check if we should fetch autoplay tracks
+                # Only trigger when queue is completely empty to avoid spam
+                queue_size = (
+                    len(self.override_queue)
+                    + len(self.insert_next_queue)
+                    + len(self.queue)
+                )
+                # Only fetch if queue is EMPTY and not already fetching
+                if queue_size == 0 and not self.autoplay_fetching:
+                    settings_data = await settings.get_guild_settings(self.guild_id)
+                    if settings_data.autoplay_enabled:
+                        asyncio.create_task(self._fetch_autoplay_tracks())
+
                 # Wait for next track
                 while not (self.override_queue or self.insert_next_queue or self.queue):
                     self.queue_event.clear()
@@ -410,14 +584,15 @@ class GuildPlayer:
                 self.cancel_idle_disconnect()
                 self._stop_warning_playback()
 
-                # Ensure voice connection
-                vc = self.voice_client
-                if not vc or not vc.is_connected():
+                # Ensure voice connection with recovery attempt
+                if not await self._ensure_voice_connection():
                     if self.interaction_channel:
                         locale = await self._get_locale()
-                        await self.interaction_channel.send(t("playback.disconnected_stop", locale))
+                        await self.interaction_channel.send(t("errors.voice_connection_lost", locale))
                     await self.stop()
                     return
+
+                vc = self.voice_client
 
                 ffmpeg_path = audio.get_ffmpeg_executable()
 
@@ -454,25 +629,82 @@ class GuildPlayer:
                     # Start pre-downloading next track in background (for gapless playback)
                     asyncio.create_task(self._preload_next_track())
                     
-                    # Notify now playing
+                    # Notify now playing with embed and buttons
                     if self.interaction_channel:
                         locale = await self._get_locale()
-                        await self.interaction_channel.send(
-                            t(
-                                "playback.now_playing",
-                                locale,
-                                title=track.title,
-                                requested_by=track.requested_by,
-                            )
+                        from . import ui
+
+                        # Create embed
+                        embed = discord.Embed(
+                            title=t("playback.now_playing_title", locale),
+                            description=f"**{track.title}**",
+                            color=0x3498db
                         )
-                    
-                    # Play from local file
-                    source = discord.FFmpegPCMAudio(
-                        filepath,
-                        executable=ffmpeg_path
-                    )
-                    
-                    vc.play(source, after=self._after_playback)
+
+                        # Add duration if available
+                        if track.duration:
+                            duration_int = int(track.duration)
+                            minutes = duration_int // 60
+                            seconds = duration_int % 60
+                            embed.add_field(
+                                name=t("playback.duration", locale),
+                                value=f"{minutes}:{seconds:02d}",
+                                inline=True
+                            )
+
+                        embed.add_field(
+                            name=t("playback.requested_by", locale),
+                            value=track.requested_by,
+                            inline=True
+                        )
+
+                        # Add URL if available
+                        if track.webpage_url:
+                            embed.add_field(
+                                name=t("playback.url", locale),
+                                value=f"[{t('playback.open_youtube', locale)}]({track.webpage_url})",
+                                inline=False
+                            )
+
+                        # Create view with buttons
+                        view = ui.NowPlayingView(guild_id=self.guild_id, locale=locale, is_paused=False)
+
+                        try:
+                            message = await self.interaction_channel.send(embed=embed, view=view)
+                            view.message = message
+                        except Exception as e:
+                            # Fallback to simple message if embed fails
+                            await self.interaction_channel.send(
+                                t(
+                                    "playback.now_playing",
+                                    locale,
+                                    title=track.title,
+                                    requested_by=track.requested_by,
+                                )
+                            )
+
+                    # Play from local file with retry logic
+                    def source_factory():
+                        return create_audio_source(filepath, ffmpeg_path)
+
+                    # Reset playback tracking
+                    self.playback_start_time = time.time()
+                    self.playback_paused_at = None
+                    self.total_paused_duration = 0.0
+
+                    logging.info("Starting playback: %s", track.title)
+                    success = await self._play_with_retry(vc, source_factory, track.title)
+
+                    if not success:
+                        # Playback failed after all retries
+                        if self.interaction_channel:
+                            locale = await self._get_locale()
+                            await self.interaction_channel.send(
+                                t("errors.playback_start_failed", locale, title=track.title)
+                            )
+                        self.next_event.set()
+                        continue
+
                     await self.next_event.wait()
 
                 except DurationLimitError as e:
@@ -508,6 +740,9 @@ class GuildPlayer:
     async def _preload_next_track(self) -> None:
         """Pre-download the next track in queue for gapless playback."""
         try:
+            # Small delay before starting to avoid I/O interference with current playback
+            await asyncio.sleep(2)
+
             # Peek at next track without removing it
             if not (self.override_queue or self.insert_next_queue or self.queue):
                 return
@@ -517,49 +752,148 @@ class GuildPlayer:
                 + list(self.insert_next_queue)
                 + list(self.queue)
             )
-            
+
             # Try to preload tracks in order, skipping unavailable ones
             for idx, next_track in enumerate(queue_list):
                 if not next_track:
                     continue
-                logging.info("Preload candidate: %s", next_track.title)
+                logging.debug("Preload candidate %d: %s", idx + 1, next_track.title)
                 
                 # If already downloaded, we're done
                 if next_track.filepath and os.path.exists(next_track.filepath):
-                    logging.info("Next track already cached: %s", next_track.title)
+                    logging.debug("Next track already cached: %s", next_track.title)
                     return
-                
+
                 # Try to download this track
                 try:
                     video_id = extract_video_id(next_track.webpage_url)
                     cached_path = get_cached_path(video_id)
-                    
+
                     if cached_path:
                         next_track.filepath = cached_path
-                        logging.info("Next track preloaded from cache: %s", next_track.title)
+                        logging.info("Preloaded from cache: %s", next_track.title)
                         return
                     else:
+                        logging.info("Preloading: %s", next_track.title)
                         filepath = await download_track(next_track.webpage_url, video_id)
                         next_track.filepath = filepath
-                        logging.info("Next track preloaded: %s", next_track.title)
+                        logging.info("Preloaded successfully: %s", next_track.title)
                         return
-                        
+
                 except Exception as e:
                     # This track failed, mark it and try next one
                     logging.warning(
-                        "Preload failed for %s (skipping): %s",
+                        "Preload failed for %s (trying next): %s",
                         next_track.title,
                         str(e)[:100],
                     )
                     # Mark as failed so player_loop can skip it
                     next_track.filepath = "FAILED"
+
+                    # Small delay before trying next track
+                    await asyncio.sleep(1)
                     continue
-            
+
             # If we got here, all tracks in queue failed
             logging.warning("No upcoming tracks could be preloaded")
-                
+
         except Exception as e:
             logging.exception("Preload error")
+
+    async def _fetch_autoplay_tracks(self) -> None:
+        """
+        Fetch autoplay recommendations and pre-download them.
+        Downloads tracks BEFORE adding to queue for seamless playback.
+        """
+        if self.autoplay_fetching:
+            return
+
+        self.autoplay_fetching = True
+        try:
+            settings_data = await settings.get_guild_settings(self.guild_id)
+            if not settings_data.autoplay_enabled:
+                return
+
+            logging.info("Fetching autoplay recommendations...")
+            tracks = await self.autoplay_manager.get_recommendations("Autoplay", count=3)
+
+            if not tracks:
+                logging.debug("No autoplay tracks returned")
+                return
+
+            logging.info("Got %d autoplay tracks, pre-downloading...", len(tracks))
+
+            # PRE-DOWNLOAD tracks before adding to queue
+            ready_tracks: list[Track] = []
+            for idx, track in enumerate(tracks, 1):
+                try:
+                    video_id = extract_video_id(track.webpage_url)
+                    cached = get_cached_path(video_id)
+
+                    if cached:
+                        track.filepath = cached
+                        logging.debug(
+                            "Autoplay track %d/%d cached: %s",
+                            idx,
+                            len(tracks),
+                            track.title
+                        )
+                    else:
+                        logging.info(
+                            "Autoplay: Downloading track %d/%d: %s",
+                            idx,
+                            len(tracks),
+                            track.title
+                        )
+                        filepath = await download_track(track.webpage_url, video_id)
+                        track.filepath = filepath
+                        logging.info(
+                            "Autoplay: Downloaded track %d/%d: %s",
+                            idx,
+                            len(tracks),
+                            track.title
+                        )
+
+                    ready_tracks.append(track)
+
+                    # Small delay between downloads to avoid overwhelming the system
+                    if idx < len(tracks):
+                        await asyncio.sleep(0.5)
+
+                except Exception as e:
+                    logging.warning(
+                        "Autoplay preload failed for %s: %s",
+                        track.title,
+                        str(e)[:100]
+                    )
+                    # Don't add failed tracks to queue
+                    continue
+
+            # Add successfully downloaded tracks to queue
+            if ready_tracks:
+                self.queue.extend(ready_tracks)
+                self.queue_event.set()
+
+                logging.info("Autoplay: Added %d ready tracks to queue", len(ready_tracks))
+
+                if self.interaction_channel:
+                    locale = await self._get_locale()
+                    await self.interaction_channel.send(
+                        t("autoplay.added", locale, count=len(ready_tracks))
+                    )
+            else:
+                logging.warning("Autoplay: No tracks could be downloaded - all failed")
+                # Notify user that autoplay failed
+                if self.interaction_channel:
+                    locale = await self._get_locale()
+                    await self.interaction_channel.send(
+                        t("autoplay.fetch_failed", locale)
+                    )
+
+        except Exception as e:
+            logging.error("Autoplay fetch failed: %s", e)
+        finally:
+            self.autoplay_fetching = False
 
 
 class DurationLimitError(Exception):
@@ -592,18 +926,46 @@ async def download_track(url: str, video_id: str) -> str:
     Downloads audio from YouTube URL and returns the local filepath.
     Uses yt-dlp to download the best audio format.
     Checks duration before downloading.
+    Supports configurable audio format (opus/mp3) and quality.
     """
+    from . import config
+    from . import audio_debug
+
+    start_time = time.time()
+
+    # Get audio format configuration
+    audio_format = getattr(config, 'DJE_AUDIO_FORMAT', 'opus')
+    audio_bitrate = getattr(config, 'DJE_AUDIO_BITRATE', '128')
+    audio_normalize = getattr(config, 'DJE_AUDIO_NORMALIZE', False)
+
+    # Determine file extension based on format
+    file_ext = 'opus' if audio_format == 'opus' else 'mp3'
+
     # Use video_id for consistent filename (enables caching)
     output_template = os.path.join(DOWNLOAD_DIR, f"{video_id}.%(ext)s")
-    final_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-    
-    # If file already exists (race condition check), return it
-    if os.path.exists(final_path):
-        _audio_cache[video_id] = (final_path, time.time())
-        schedule_deletion(final_path, 15 * 60)
-        logging.info("Download cache hit for video_id=%s", video_id)
-        return final_path
-    
+    final_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.{file_ext}")
+
+    # Check for both opus and mp3 versions (in case format changed)
+    for ext in ['opus', 'mp3']:
+        check_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}")
+        if os.path.exists(check_path):
+            _audio_cache[video_id] = (check_path, time.time())
+            schedule_deletion(check_path, 15 * 60)
+            logging.info("Download cache hit for video_id=%s (format: %s)", video_id, ext)
+            return check_path
+
+    # Build postprocessors
+    postprocessors = [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': audio_format,
+        'preferredquality': audio_bitrate,
+    }]
+
+    # Add loudnorm filter if normalization is enabled
+    postprocessor_args = {}
+    if audio_normalize:
+        postprocessor_args['ffmpeg'] = ['-af', 'loudnorm=I=-16:TP=-1.5:LRA=11']
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
@@ -612,49 +974,51 @@ async def download_track(url: str, video_id: str) -> str:
         'no_warnings': True,
         # Critical: Use android client for better compatibility
         'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
+        'postprocessors': postprocessors,
         'ffmpeg_location': audio.get_ffmpeg_executable(),
     }
-    
+
+    if postprocessor_args:
+        ydl_opts['postprocessor_args'] = postprocessor_args
+
     loop = asyncio.get_event_loop()
-    
+
     def do_download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # First, extract info without downloading to check duration
             logging.info("Fetching metadata for download video_id=%s", video_id)
             info = ydl.extract_info(url, download=False)
-            
+
             if info:
                 duration = info.get('duration', 0)
                 if duration and duration > MAX_DURATION_SECONDS:
                     minutes = int(duration // 60)
                     max_minutes = int(MAX_DURATION_SECONDS // 60)
                     raise DurationLimitError(minutes, max_minutes)
-            
+
             # Now download
-            logging.info("Starting download video_id=%s", video_id)
+            logging.info("Starting download video_id=%s (format: %s, bitrate: %s)", video_id, audio_format, audio_bitrate)
             info = ydl.extract_info(url, download=True)
             if info:
                 return final_path
         return None
-    
+
     filepath = await loop.run_in_executor(None, do_download)
-    
+
     if not filepath or not os.path.exists(filepath):
         logging.error("Download failed for video_id=%s", video_id)
         raise Exception("Download failed")
 
     # Add to cache
     _audio_cache[video_id] = (filepath, time.time())
-    
+
     # Schedule deletion after 15 minutes
     schedule_deletion(filepath, 15 * 60)
-    
-    logging.info("Download completed video_id=%s", video_id)
+
+    # Log download time for instrumentation
+    download_time = time.time() - start_time
+    audio_debug.log_download_time(download_time)
+    logging.info("Download completed video_id=%s in %.1fs", video_id, download_time)
     return filepath
 
 

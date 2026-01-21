@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import sys
+import ssl
 import discord
+import aiohttp
+from collections import deque
 from discord import app_commands
 from . import config
 from .config import DISCORD_TOKEN, DISCORD_GUILD_ID
@@ -26,11 +29,24 @@ def get_player(guild: discord.Guild) -> player_module.GuildPlayer:
         players[guild.id] = player_module.GuildPlayer(guild.id, guild.voice_client.client if guild.voice_client else None, None) # Client is passed awkwardly here, will fix below
     return players[guild.id]
 
-class AzimClient(discord.Client):
+class DjeClient(discord.Client):
     def __init__(self) -> None:
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(
+            intents=discord.Intents.default()
+        )
         self.tree = app_commands.CommandTree(self)
         self.cleanup_task = None
+
+    async def setup_hook(self) -> None:
+        """Called when the client is setting up. Event loop is available here."""
+        # Apply WARP/VPN compatibility settings if needed
+        if config.DISABLE_DISCORD_SSL_VERIFY:
+            logging.warning(
+                "SSL verification disabled for Discord connections. "
+                "This is a workaround for WARP/VPN issues."
+            )
+            # The connector is already created by discord.py at this point,
+            # so we'll handle SSL via the http module if needed
 
     async def on_ready(self) -> None:
         global net_health
@@ -67,12 +83,46 @@ class AzimClient(discord.Client):
             if net_health:
                 await net_health.record_failure(e, "gateway")
     
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState
+    ) -> None:
+        """Log voice state changes for the bot for debugging."""
+        # Only log changes for the bot itself
+        if member.id != self.user.id:
+            return
+
+        from . import audio_debug
+
+        if before.channel != after.channel:
+            if before.channel is None and after.channel is not None:
+                logging.info("Voice: Connected to %s", after.channel.name)
+                if audio_debug.is_debug_enabled():
+                    logging.debug("Voice connection details: guild=%s, channel_id=%s",
+                                  member.guild.name, after.channel.id)
+            elif before.channel is not None and after.channel is None:
+                logging.info("Voice: Disconnected from %s", before.channel.name)
+            elif before.channel is not None and after.channel is not None:
+                logging.info("Voice: Moved from %s to %s", before.channel.name, after.channel.name)
+
     async def periodic_cleanup(self) -> None:
         """Background task to clean up inactive downloads every 5 minutes."""
         await self.wait_until_ready()
         while not self.is_closed():
             await asyncio.sleep(5 * 60)  # Every 5 minutes
             try:
+                # Check if any player is currently playing
+                any_playing = any(
+                    p.voice_client and p.voice_client.is_playing()
+                    for p in players.values()
+                )
+
+                if any_playing:
+                    logging.debug("Skipping cleanup - audio currently playing")
+                    continue
+
                 deleted = await player_module.cleanup_inactive_downloads(players)
                 if deleted > 0:
                     logging.info("Periodic cleanup removed %d inactive files", deleted)
@@ -103,7 +153,7 @@ def main() -> None:
     # Ensure opus is loaded before doing anything voice-related
     audio.load_opus_lib()
     logging.info("Launching Discord client")
-    client = AzimClient()
+    client = DjeClient()
 
     async def get_locale(interaction: discord.Interaction) -> str:
         if not interaction.guild_id:
@@ -423,11 +473,12 @@ def main() -> None:
         def __init__(self) -> None:
             super().__init__(name="shortcuts", description="Shortcut management")
 
-        async def callback(self, interaction: discord.Interaction) -> None:
-            await send_shortcuts_list(interaction)
-
     shortcuts_group = ShortcutsGroup()
     client.tree.add_command(shortcuts_group)
+
+    @shortcuts_group.command(name="list", description="Show all shortcuts")
+    async def shortcuts_list(interaction: discord.Interaction) -> None:
+        await send_shortcuts_list(interaction)
 
     class SettingsGroup(app_commands.Group):
         def __init__(self) -> None:
@@ -528,26 +579,55 @@ def main() -> None:
 
         locale = await get_locale(interaction)
         settings_data = await settings.get_guild_settings(interaction.guild_id)
+
         embed = ui.make_embed("info.embed_title", locale=locale)
-        embed.add_field(name=t("info.field_version", locale), value=VERSION, inline=True)
+
+        # Set bot avatar as thumbnail
+        if client.user and client.user.avatar:
+            embed.set_thumbnail(url=client.user.avatar.url)
+
+        embed.description = t("info.description", locale)
+
+        # Statistics
         embed.add_field(
-            name=t("info.field_locale", locale), value=settings_data.locale, inline=True
+            name=f"📊 {t('info.field_statistics', locale)}",
+            value=(
+                f"**{t('info.field_version', locale)}:** {VERSION}\n"
+                f"**{t('info.field_locale', locale)}:** {settings_data.locale}\n"
+                f"**{t('info.field_shortcuts', locale)}:** {len(settings_data.shortcuts)}\n"
+                f"**{t('info.field_servers', locale)}:** {len(client.guilds)}"
+            ),
+            inline=False
         )
+
+        # Current Settings
+        autoplay = t("common.on", locale) if settings_data.autoplay_enabled else t("common.off", locale)
+        shuffle = settings_data.shuffle_mode
+        loop = settings_data.loop_mode
+
         embed.add_field(
-            name=t("info.field_shortcuts", locale),
-            value=str(len(settings_data.shortcuts)),
-            inline=True,
+            name=f"⚙️ {t('info.field_settings', locale)}",
+            value=f"**Shuffle:** {shuffle}\n**Loop:** {loop}\n**Autoplay:** {autoplay}",
+            inline=True
         )
+
+        # Generate invite URL
+        permissions = discord.Permissions(36779584)
+        invite_url = discord.utils.oauth_url(client.user.id, permissions=permissions, scopes=["bot", "applications.commands"])
+
+        # Links
         embed.add_field(
-            name=t("info.field_repo", locale),
-            value="https://github.com/gkhntpbs/Dje",
-            inline=False,
+            name=f"🔗 {t('info.field_links', locale)}",
+            value=(
+                f"[{t('info.link_repo', locale)}](https://github.com/gkhntpbs/Dje)\n"
+                f"[{t('info.link_support', locale)}](https://www.buymeacoffee.com/gkhntpbs)\n"
+                f"[{t('info.link_invite', locale)}]({invite_url})"
+            ),
+            inline=True
         )
-        embed.add_field(
-            name=t("info.field_support", locale),
-            value="https://www.buymeacoffee.com/gkhntpbs",
-            inline=False,
-        )
+
+        embed.set_footer(text=t("info.footer_tip", locale))
+
         await send_message(interaction, embed=embed)
 
     async def do_skip(interaction: discord.Interaction) -> None:
@@ -850,12 +930,17 @@ def main() -> None:
             else t("common.off", locale)
         )
 
+        autoplay_text = t("common.on", locale) if settings_data.autoplay_enabled else t("common.off", locale)
+        warning_enabled_text = t("common.on", locale) if settings_data.auto_disconnect_warning_enabled else t("common.off", locale)
         lines = [
+            f"**Language:** {settings_data.locale}",
             f"**Shuffle:** {settings_data.shuffle_mode}",
             f"**Loop:** {settings_data.loop_mode}",
+            f"**Autoplay:** {autoplay_text}",
             f"**Auto-disconnect:** {enabled_text}",
             f"**Timeout:** {settings_data.auto_disconnect_minutes} min",
-            f"**Warning:** {settings_data.auto_disconnect_warn_minutes} min before disconnect",
+            f"**Warning time:** {settings_data.auto_disconnect_warn_minutes} min before disconnect",
+            f"**Warning audio:** {warning_enabled_text}",
         ]
         await send_message(interaction, "\n".join(lines))
 
@@ -904,16 +989,8 @@ def main() -> None:
     async def join(interaction: discord.Interaction) -> None:
         await do_join(interaction)
 
-    @client.tree.command(name="j", description="Alias for /join")
-    async def join_alias(interaction: discord.Interaction) -> None:
-        await do_join(interaction)
-
     @client.tree.command(name="leave", description="Leave the voice channel")
     async def leave(interaction: discord.Interaction) -> None:
-        await do_leave(interaction)
-
-    @client.tree.command(name="l", description="Alias for /leave")
-    async def leave_alias(interaction: discord.Interaction) -> None:
         await do_leave(interaction)
 
     @client.tree.command(
@@ -928,23 +1005,9 @@ def main() -> None:
     async def play(interaction: discord.Interaction, query: str) -> None:
         await do_play(interaction, query)
 
-    @client.tree.command(name="p", description="Alias for /play")
-    async def play_alias(interaction: discord.Interaction, query: str) -> None:
-        await do_play(interaction, query)
-
     @client.tree.command(name="playnext", description="Insert as next in queue")
     async def playnext(interaction: discord.Interaction, query: str) -> None:
         await do_playnext(interaction, query)
-
-    @client.tree.command(name="language", description="Set server language")
-    @app_commands.choices(locale=LOCALE_CHOICES)
-    async def language(interaction: discord.Interaction, locale: str) -> None:
-        await set_language(interaction, locale)
-
-    @client.tree.command(name="lang", description="Alias for /language")
-    @app_commands.choices(locale=LOCALE_CHOICES)
-    async def language_alias(interaction: discord.Interaction, locale: str) -> None:
-        await set_language(interaction, locale)
 
     @settings_group.command(name="autodisconnect", description="Toggle idle auto-disconnect")
     @app_commands.choices(state=AUTODISC_CHOICES)
@@ -983,18 +1046,44 @@ def main() -> None:
     async def settings_loop(interaction: discord.Interaction, mode: str) -> None:
         await do_settings_loop(interaction, mode)
 
-    @client.tree.command(name="sc", description="Alias for /shortcuts")
-    async def shortcuts_alias(interaction: discord.Interaction) -> None:
-        await send_shortcuts_list(interaction)
+    @settings_group.command(name="autoplay", description="Toggle autoplay mode")
+    @app_commands.choices(state=[
+        app_commands.Choice(name="on", value="on"),
+        app_commands.Choice(name="off", value="off"),
+    ])
+    async def settings_autoplay(interaction: discord.Interaction, state: str) -> None:
+        if not interaction.guild_id:
+            await send_message(interaction, t("errors.guild_only", "tr"), ephemeral=True)
+            return
+
+        locale = await get_locale(interaction)
+        enabled = state.strip().lower() == "on"
+        await settings.set_autoplay_enabled(interaction.guild_id, enabled)
+
+        key = "autoplay.enabled" if enabled else "autoplay.disabled"
+        await send_message(interaction, t(key, locale))
+
+    @settings_group.command(name="language", description="Set server language")
+    @app_commands.choices(locale=LOCALE_CHOICES)
+    async def settings_language(interaction: discord.Interaction, locale: app_commands.Choice[str]) -> None:
+        await set_language(interaction, locale.value)
+
+    @settings_group.command(name="autodisconnect_warning", description="Toggle auto-disconnect warning audio")
+    @app_commands.choices(state=AUTODISC_CHOICES)
+    async def settings_autodisconnect_warning(interaction: discord.Interaction, state: str) -> None:
+        if not interaction.guild_id:
+            await send_message(interaction, t("errors.guild_only", "tr"), ephemeral=True)
+            return
+
+        locale = await get_locale(interaction)
+        enabled = state.strip().lower() == "on"
+        await settings.set_auto_disconnect_warning_enabled(interaction.guild_id, enabled)
+
+        key = "settings.autodisc.warning_on" if enabled else "settings.autodisc.warning_off"
+        await send_message(interaction, t(key, locale))
 
     @shortcuts_group.command(name="add", description="Add a shortcut")
     async def shortcuts_add(interaction: discord.Interaction, name: str, url: str) -> None:
-        await do_shortcuts_add(interaction, name, url)
-
-    @shortcuts_group.command(name="a", description="Alias for /shortcuts add")
-    async def shortcuts_add_alias(
-        interaction: discord.Interaction, name: str, url: str
-    ) -> None:
         await do_shortcuts_add(interaction, name, url)
 
     async def do_shortcuts_add(
@@ -1026,10 +1115,6 @@ def main() -> None:
     async def shortcuts_remove(interaction: discord.Interaction, name: str) -> None:
         await do_shortcuts_remove(interaction, name)
 
-    @shortcuts_group.command(name="rm", description="Alias for /shortcuts remove")
-    async def shortcuts_remove_alias(interaction: discord.Interaction, name: str) -> None:
-        await do_shortcuts_remove(interaction, name)
-
     async def do_shortcuts_remove(interaction: discord.Interaction, name: str) -> None:
         if not interaction.guild_id:
             await send_message(interaction, t("errors.guild_only", "tr"), ephemeral=True)
@@ -1048,10 +1133,6 @@ def main() -> None:
 
     @shortcuts_group.command(name="play", description="Play a shortcut")
     async def shortcuts_play(interaction: discord.Interaction, name: str) -> None:
-        await do_shortcuts_play(interaction, name)
-
-    @shortcuts_group.command(name="p", description="Alias for /shortcuts play")
-    async def shortcuts_play_alias(interaction: discord.Interaction, name: str) -> None:
         await do_shortcuts_play(interaction, name)
 
     async def do_shortcuts_play(interaction: discord.Interaction, name: str) -> None:
@@ -1093,72 +1174,36 @@ def main() -> None:
     async def info(interaction: discord.Interaction) -> None:
         await do_info(interaction)
 
-    @client.tree.command(name="i", description="Alias for /info")
-    async def info_alias(interaction: discord.Interaction) -> None:
-        await do_info(interaction)
-
     @client.tree.command(name="skip", description="Skip the current track")
     async def skip(interaction: discord.Interaction) -> None:
-        await do_skip(interaction)
-
-    @client.tree.command(name="sk", description="Alias for /skip")
-    async def skip_alias(interaction: discord.Interaction) -> None:
         await do_skip(interaction)
 
     @client.tree.command(name="next", description="Play the next track")
     async def next_track(interaction: discord.Interaction) -> None:
         await do_skip(interaction)
 
-    @client.tree.command(name="n", description="Alias for /next")
-    async def next_track_alias(interaction: discord.Interaction) -> None:
-        await do_skip(interaction)
-
     @client.tree.command(name="prev", description="Play the previous track")
     async def prev(interaction: discord.Interaction) -> None:
-        await do_prev(interaction)
-
-    @client.tree.command(name="pr", description="Alias for /prev")
-    async def prev_alias(interaction: discord.Interaction) -> None:
         await do_prev(interaction)
 
     @client.tree.command(name="pause", description="Pause playback")
     async def pause(interaction: discord.Interaction) -> None:
         await do_pause(interaction)
 
-    @client.tree.command(name="pa", description="Alias for /pause")
-    async def pause_alias(interaction: discord.Interaction) -> None:
-        await do_pause(interaction)
-
     @client.tree.command(name="resume", description="Resume playback")
     async def resume(interaction: discord.Interaction) -> None:
-        await do_resume(interaction)
-
-    @client.tree.command(name="r", description="Alias for /resume")
-    async def resume_alias(interaction: discord.Interaction) -> None:
         await do_resume(interaction)
 
     @client.tree.command(name="stop", description="Stop playback and clear the queue")
     async def stop(interaction: discord.Interaction) -> None:
         await do_stop(interaction)
 
-    @client.tree.command(name="st", description="Alias for /stop")
-    async def stop_alias(interaction: discord.Interaction) -> None:
-        await do_stop(interaction)
-
     @client.tree.command(name="queue", description="Show the queue")
     async def queue(interaction: discord.Interaction) -> None:
         await do_queue(interaction)
 
-    @client.tree.command(name="q", description="Alias for /queue")
-    async def queue_alias(interaction: discord.Interaction) -> None:
-        await do_queue(interaction)
-
     @client.tree.command(name="shuffle", description="Apply shuffle to queue")
     async def shuffle(interaction: discord.Interaction) -> None:
-        await do_shuffle(interaction)
-
-    @client.tree.command(name="sh", description="Alias for /shuffle")
-    async def shuffle_alias(interaction: discord.Interaction) -> None:
         await do_shuffle(interaction)
 
     @client.tree.command(name="loop", description="Set loop mode")
@@ -1170,14 +1215,23 @@ def main() -> None:
     async def loop_cmd(interaction: discord.Interaction, mode: str) -> None:
         await do_loop(interaction, mode)
 
-    @client.tree.command(name="lo", description="Alias for /loop")
-    @app_commands.choices(mode=[
-        app_commands.Choice(name="Off", value="off"),
-        app_commands.Choice(name="Queue", value="queue"),
-        app_commands.Choice(name="Single", value="single"),
+    @client.tree.command(name="autoplay", description="Toggle autoplay mode")
+    @app_commands.choices(state=[
+        app_commands.Choice(name="on", value="on"),
+        app_commands.Choice(name="off", value="off"),
     ])
-    async def loop_alias(interaction: discord.Interaction, mode: str) -> None:
-        await do_loop(interaction, mode)
+    async def autoplay_cmd(interaction: discord.Interaction, state: str) -> None:
+        if not interaction.guild_id:
+            locale = await get_locale(interaction)
+            await send_message(interaction, t("errors.guild_only", locale), ephemeral=True)
+            return
+
+        locale = await get_locale(interaction)
+        enabled = state.strip().lower() == "on"
+        await settings.set_autoplay_enabled(interaction.guild_id, enabled)
+
+        key = "autoplay.enabled" if enabled else "autoplay.disabled"
+        await send_message(interaction, t(key, locale))
 
     @client.tree.command(name="netinfo", description="Show network health diagnostics")
     async def netinfo(interaction: discord.Interaction) -> None:
@@ -1255,6 +1309,26 @@ def main() -> None:
                 for tip in tips[:5]:  # Show first 5 tips
                     lines.append(tip)
 
+            # Audio statistics section
+            from . import audio_debug
+            audio_stats = audio_debug.get_stats()
+            lines.append("")
+            lines.append("**Audio Statistics:**")
+            lines.append(f"• Tracks played: {audio_stats['tracks_played']}")
+            lines.append(f"• Tracks failed: {audio_stats['tracks_failed']}")
+            lines.append(f"• FFmpeg retries: {audio_stats['ffmpeg_retries']}")
+            if audio_stats['avg_download_time'] > 0:
+                lines.append(f"• Avg download time: {audio_stats['avg_download_time']}s")
+            debug_status = "enabled" if audio_stats['debug_enabled'] else "disabled"
+            lines.append(f"• Debug mode: {debug_status}")
+
+            # Show recent audio errors if any
+            if audio_stats['recent_errors_by_type']:
+                lines.append("")
+                lines.append("**Recent Audio Errors (last 5 min):**")
+                for error_type, count in audio_stats['recent_errors_by_type'].items():
+                    lines.append(f"• {error_type}: {count}")
+
             message = "\n".join(lines)
 
             # Send as ephemeral message
@@ -1266,6 +1340,213 @@ def main() -> None:
                 f"❌ Failed to retrieve network info: {e}",
                 ephemeral=True
             )
+
+    @client.tree.command(name="help", description="Show all available commands")
+    async def help_cmd(interaction: discord.Interaction) -> None:
+        locale = await get_locale(interaction)
+        embed = ui.make_embed("help.title", locale=locale)
+
+        embed.add_field(name="🎵 " + t("help.playback", locale), value=t("help.playback_desc", locale), inline=False)
+        embed.add_field(name="📋 " + t("help.queue", locale), value=t("help.queue_desc", locale), inline=False)
+        embed.add_field(name="⚙️ " + t("help.settings", locale), value=t("help.settings_desc", locale), inline=False)
+        embed.add_field(name="⭐ " + t("help.shortcuts", locale), value=t("help.shortcuts_desc", locale), inline=False)
+        embed.add_field(name="🔊 " + t("help.voice", locale), value=t("help.voice_desc", locale), inline=False)
+        embed.add_field(name="ℹ️ " + t("help.info", locale), value=t("help.info_desc", locale), inline=False)
+
+        await send_message(interaction, embed=embed)
+
+    @client.tree.command(name="clear", description="Clear all upcoming tracks from queue")
+    async def clear(interaction: discord.Interaction) -> None:
+        locale = await get_locale(interaction)
+        if not interaction.guild or interaction.guild.id not in players:
+            await send_message(interaction, t("queue.nothing_to_clear", locale), ephemeral=True)
+            return
+
+        player = players[interaction.guild.id]
+        count = len(player.override_queue) + len(player.insert_next_queue) + len(player.queue)
+
+        if count == 0:
+            await send_message(interaction, t("queue.nothing_to_clear", locale), ephemeral=True)
+            return
+
+        player.override_queue.clear()
+        player.insert_next_queue.clear()
+        player.queue.clear()
+
+        await send_message(interaction, t("queue.cleared", locale, count=count))
+
+    @client.tree.command(name="remove", description="Remove a track from queue by position")
+    async def remove(interaction: discord.Interaction, position: int) -> None:
+        locale = await get_locale(interaction)
+        if not interaction.guild or interaction.guild.id not in players:
+            await send_message(interaction, t("queue.empty", locale), ephemeral=True)
+            return
+
+        player = players[interaction.guild.id]
+        queue_list = list(player.override_queue) + list(player.insert_next_queue) + list(player.queue)
+
+        if position < 1 or position > len(queue_list):
+            await send_message(interaction, t("queue.invalid_position", locale, max=len(queue_list)), ephemeral=True)
+            return
+
+        removed_track = queue_list[position - 1]
+
+        # Remove from appropriate queue (override → insert_next → main)
+        idx = position - 1
+        override_len = len(player.override_queue)
+        insert_next_len = len(player.insert_next_queue)
+
+        if idx < override_len:
+            temp = list(player.override_queue)
+            temp.pop(idx)
+            player.override_queue = deque(temp)
+        elif idx < override_len + insert_next_len:
+            temp = list(player.insert_next_queue)
+            temp.pop(idx - override_len)
+            player.insert_next_queue = deque(temp)
+        else:
+            temp = list(player.queue)
+            temp.pop(idx - override_len - insert_next_len)
+            player.queue = deque(temp)
+
+        await send_message(interaction, t("queue.removed", locale, title=removed_track.title))
+
+    def format_duration(seconds: float) -> str:
+        """Format seconds as MM:SS"""
+        total_seconds = int(seconds)
+        minutes = total_seconds // 60
+        secs = total_seconds % 60
+        return f"{minutes}:{secs:02d}"
+
+    @client.tree.command(name="timestamp", description="Show current track timeline")
+    async def timestamp(interaction: discord.Interaction) -> None:
+        locale = await get_locale(interaction)
+
+        if not interaction.guild or interaction.guild.id not in players:
+            await send_message(interaction, t("timestamp.nothing_playing", locale), ephemeral=True)
+            return
+
+        player = players[interaction.guild.id]
+        if not player.current or not player.current.duration:
+            await send_message(interaction, t("timestamp.nothing_playing", locale), ephemeral=True)
+            return
+
+        # Get current position
+        current_pos = player.get_current_position()
+        if current_pos is None:
+            current_pos = 0
+
+        # Format times
+        current_str = format_duration(int(current_pos))
+        total_str = format_duration(player.current.duration)
+
+        # Create progress bar (30 characters wide)
+        bar_length = 30
+        progress = min(current_pos / player.current.duration, 1.0) if player.current.duration > 0 else 0
+        filled = int(bar_length * progress)
+
+        # Build progress bar: ━━━━●─────
+        bar = "━" * filled + "●" + "─" * (bar_length - filled - 1)
+
+        embed = ui.make_embed("timestamp.title", locale=locale)
+        embed.add_field(
+            name=t("timestamp.current_track", locale),
+            value=player.current.title,
+            inline=False
+        )
+        embed.add_field(
+            name=t("timestamp.progress", locale),
+            value=f"`{current_str} {bar} {total_str}`",
+            inline=False
+        )
+
+        await send_message(interaction, embed=embed)
+
+    async def fetch_lyrics(artist: str, title: str) -> str | None:
+        """Fetch lyrics from lyrics.ovh API"""
+        import aiohttp
+        url = f"https://api.lyrics.ovh/v1/{artist}/{title}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data.get("lyrics")
+        except Exception as e:
+            logging.error("Lyrics fetch error: %s", e)
+        return None
+
+    @client.tree.command(name="lyrics", description="Show lyrics for current track")
+    async def lyrics(interaction: discord.Interaction) -> None:
+        locale = await get_locale(interaction)
+
+        if not interaction.guild or interaction.guild.id not in players:
+            await send_message(interaction, t("lyrics.nothing_playing", locale), ephemeral=True)
+            return
+
+        player = players[interaction.guild.id]
+        if not player.current:
+            await send_message(interaction, t("lyrics.nothing_playing", locale), ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        # Extract artist and title (usually "Artist - Title")
+        title_parts = player.current.title.split(" - ", 1)
+        if len(title_parts) == 2:
+            artist, title = title_parts[0].strip(), title_parts[1].strip()
+        else:
+            artist, title = "", player.current.title.strip()
+
+        lyrics_text = await fetch_lyrics(artist, title)
+
+        if not lyrics_text:
+            await send_message(interaction, t("lyrics.not_found", locale, title=player.current.title), ephemeral=True)
+            return
+
+        # Truncate if too long (Discord embed limit: 4096 chars)
+        if len(lyrics_text) > 4000:
+            lyrics_text = lyrics_text[:3997] + "..."
+
+        embed = ui.make_embed("lyrics.title", locale=locale, title=player.current.title)
+        embed.description = lyrics_text
+
+        await send_message(interaction, embed=embed)
+
+    @client.tree.command(name="invite", description="Get bot invite link")
+    async def invite(interaction: discord.Interaction) -> None:
+        locale = await get_locale(interaction)
+
+        # Required permissions: Send Messages, Connect, Speak, Use Voice Activity, Embed Links, Read Message History
+        # Permission value: 36779584
+        permissions = discord.Permissions(36779584)
+
+        invite_url = discord.utils.oauth_url(
+            client.user.id,
+            permissions=permissions,
+            scopes=["bot", "applications.commands"]
+        )
+
+        embed = ui.make_embed("invite.title", locale=locale)
+        embed.description = t("invite.description", locale)
+        embed.add_field(name="🔗 Link", value=f"[{t('invite.click_here', locale)}]({invite_url})", inline=False)
+
+        await send_message(interaction, embed=embed)
+
+    @client.tree.command(name="support", description="Support the developer")
+    async def support(interaction: discord.Interaction) -> None:
+        locale = await get_locale(interaction)
+
+        embed = ui.make_embed("support.title", locale=locale)
+        embed.description = t("support.description", locale)
+        embed.add_field(
+            name="☕ Buy Me a Coffee",
+            value="https://www.buymeacoffee.com/gkhntpbs",
+            inline=False
+        )
+        embed.set_thumbnail(url="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png")
+
+        await send_message(interaction, embed=embed)
 
     client.run(DISCORD_TOKEN)
 
